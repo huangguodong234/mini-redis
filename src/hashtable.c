@@ -78,7 +78,7 @@ void hashtable_set(HashTable *ht,const char *key,const char *value){
 // 返回：如果找到，返回 value 字符串的指针（不要 free 它！）
 //       如果找不到，返回 NULL
 
-char *hasttable_get(HashTable *ht,const char *key){
+char *hashtable_get(HashTable *ht,const char *key){
     unsigned long hash =hash_djb2(key);
     int index =hash % ht->capacity;
 
