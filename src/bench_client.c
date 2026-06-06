@@ -25,8 +25,8 @@
 #define PORT 6379
 #define IP   "127.0.0.1"
 
-#define TOTAL_KEYS   100000   // 插入的 key 总数
-#define TEST_ROUNDS  100000   // 随机查询次数
+#define TOTAL_KEYS   1000000   // 插入的 key 总数
+#define TEST_ROUNDS  1000000   // 随机查询次数
 
 // ---------- 发送一个字符串到服务器 ----------
 void send_data(int fd, const char *data) {
