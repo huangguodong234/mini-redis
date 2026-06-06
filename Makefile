@@ -10,8 +10,8 @@ CC      = gcc                    # 编译器
 CFLAGS  = -Wall -g -Iinclude     # 编译选项：-Wall 显示所有警告，-g 加调试信息，-Iinclude 指定头文件目录
 TARGET  = server                 # 最终生成的可执行文件名
 
-# 2. 源文件列表（手动指定，因为我们只有 3 个 .c）
-SRCS    = src/server.c src/protocol.c src/storage.c
+# 2. 源文件列表（手动指定，因为我们只有 4 个 .c）
+SRCS    = src/server.c src/protocol.c src/storage.c src/hashtable.c
 
 # 3. 将 .c 后缀替换为 .o，得到目标文件列表
 #    例如：src/server.c → src/server.o

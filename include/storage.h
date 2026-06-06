@@ -1,17 +1,11 @@
 #ifndef STORAGE_H
 #define STORAGE_H
 
-// 表示一个键值对
-typedef struct {
-    char *key;      // 键
-    char *value;    // 值
-} Entry;
+#include "hashtable.h"    //因为要用 HashTable
 
-// 动态数组存储结构
+// 动态数组存储结构变哈希表，时间复杂度从O（n）变o(1) 
 typedef struct {
-    Entry *entries; // 指向动态数组的指针
-    int count;      // 当前已存储的键值对数量
-    int capacity;   // 数组当前的最大容量
+    HashTable *ht; // 底层存储变成哈希表
 } Storage;
 
 // 创建并初始化存储引擎

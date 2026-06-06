@@ -5,6 +5,8 @@
 #include <sys/socket.h>      //connect () 是什么？ 作用：客户端主动连接服务器。
 #include <netinet/in.h>
 #include <arpa/inet.h>      //inet_pton()-把人类可以看懂的IP地址，转化为计算机可以看懂的二进制地址
+
+
 #define SERVER_PORT 6379
 #define SERVER_IP "127.0.0.1"
 
