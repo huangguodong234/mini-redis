@@ -32,9 +32,21 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# 6. 清理规则：删除编译产物
-clean:
-	rm -f $(OBJS) $(TARGET)
+# 自动化测试：先编译，再运行 test.sh
+test: all
+	./test.sh
 
-# 7. 伪目标声明（避免目录下恰好有名为 all/clean 的文件导致冲突）
-.PHONY: all clean
+# 内存检查
+valgrind: $(TARGET)
+	valgrind --leak-check=full --show-leak-kinds=all ./server
+
+# 清理规则：删除编译产物
+clean:
+	rm -f $(OBJS) $(TARGET)	
+
+# 彻底清理
+distclean: clean
+	rm -f test_client test_hash test_hashtable test_resize bench_client
+
+# 伪目标声明（避免目录下恰好有名为 all/clean 的文件导致冲突）
+.PHONY: all test valgrind clean distclean
