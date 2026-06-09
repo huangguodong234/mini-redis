@@ -46,7 +46,7 @@ void handls_command(int client_fd,Command *cmd,Storage *store)  //(文件描述�
     //SET命令
     if(strcasecmp(cmd_name,"SET")==0){
         if(cmd->argc !=3){
-            send_response(client_fd,"-ERR wrong number of arguments for 'SET\r\n");
+            send_response(client_fd,"-ERR wrong number of arguments for 'SET'\r\n");
             return;
         }
         storage_set(store,cmd->argv[1],cmd->argv[2]);
@@ -56,7 +56,7 @@ void handls_command(int client_fd,Command *cmd,Storage *store)  //(文件描述�
     //GET 分支
     else if(strcasecmp(cmd_name,"GET")==0){
         if(cmd->argc !=2){
-            send_response(client_fd,"-ERR wrong number of arguments for 'SET\r\n");
+            send_response(client_fd,"-ERR wrong number of arguments for 'GET'\r\n");
             return;
         }
         char *val= storage_get(store,cmd->argv[1]);
