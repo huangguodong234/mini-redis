@@ -14,16 +14,21 @@ Storage *storage_init() {
 
 // SET 命令的实现
 void storage_set(Storage *s, const char *key, const char *value) {
+    //问题：如果意外传入了 NULL 的 Storage *s，程序会崩溃。
+    //增加参数检查
+    if(!s || !key ||!value) return;
     hashtable_set(s->ht,key,value);
 }
 
 // GET 命令的实现
 char *storage_get(Storage *s, const char *key) {
+    if(!s || !key) return NULL;
     return hashtable_get(s->ht,key);
 }
 
 // DEL 命令的实现
 int storage_del(Storage *s, const char *key) {
+    if(!s || !key) return -1;
     return hashtable_del(s->ht,key);
 }
 

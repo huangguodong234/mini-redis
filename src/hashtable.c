@@ -11,8 +11,9 @@
 #include <string.h>
 #include "hashtable.h"
 
-#define LOAD_FACTOR_THRESHOLD 0.75
-
+#define LOAD_FACTOR_THRESHOLD 0.75  
+#define _POSIX_C_SOURCE 200809L  //strdup-字符串复制函数 是 POSIX 标准函数，在某些编译环境下可能不可用。
+                                 //通过加宏来启用标准 strdup
 // ==================== djb2 哈希函数 ====================
 // 功能：把任意字符串转换成一个无符号长整数
 // 算法：hash = 5381;  hash = hash * 33 + 下一个字符的ASCII码
@@ -55,6 +56,11 @@ static void hashtable_resize(HashTable *ht){
 
     // 1. 创建新桶数组（全部初始化为 NULL）
     HashNode **new_buchets =calloc(new_capacity,sizeof(HashNode *));
+    //可能失败返回 NULL，但未检查。
+    if(!new_buchets){
+        fprintf(stderr,"内存分配失败，扩容终止\n");
+        return;
+    }
 
     // 2. 遍历所有旧桶和链表，重新哈希每个节点
     for(int i=0;i<old_capacity;i++){
@@ -87,7 +93,7 @@ static void hashtable_resize(HashTable *ht){
 //       如果 key 不存在，则在对应桶的链表头部插入新节点
 
 void hashtable_set(HashTable *ht,const char *key,const char *value){
-    // 检查是否需要扩容（在新增元素之前）-检查负载因子=元素数量/容器容量
+    // 检查是否需要扩容（在新增元素之前）-检查 负载因子=元素数量/容器容量
     double load_factor =(double)ht->size /ht->capacity;
     if(load_factor >=LOAD_FACTOR_THRESHOLD){
          //LOAD_FACTOR_THRESHOLD -负载因子阈值
