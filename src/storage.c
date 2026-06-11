@@ -28,7 +28,7 @@ char *storage_get(Storage *s, const char *key) {
 
 // DEL 命令的实现
 int storage_del(Storage *s, const char *key) {
-    if(!s || !key) return -1;
+    if(!s || !key) return 0;
     return hashtable_del(s->ht,key);
 }
 

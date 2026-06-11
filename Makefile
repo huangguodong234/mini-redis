@@ -1,5 +1,5 @@
 # ============================================================
-# Makefile for mini-redis (阶段 1：动态数组版)
+# Makefile for mini-redis (阶段 2: 哈希表版)
 # 用法：
 #   make        → 编译生成 server
 #   make clean  → 删除所有 .o 文件和 server
