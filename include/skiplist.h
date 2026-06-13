@@ -45,3 +45,5 @@ char **skiplist_range(Skiplist *sl,int start,int stop);
 // 释放整个跳表所有节点及内存，防止内存泄漏
 // sl: 待销毁的跳表结构体指针
 void skiplist_free(Skiplist *sl);
+
+#endif
