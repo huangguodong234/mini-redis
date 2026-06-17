@@ -15,7 +15,7 @@ int main() {
 
     printf("插入 4 个元素后,size = %d, max_level = %d\n\n", sl->size, sl->max_level);
 
-    // 测试查找
+    // 查找测试
     printf("查找测试:\n");
     SkipNode *node = skiplist_find(sl, "banana");
     if (node) {
@@ -30,6 +30,20 @@ int main() {
     } else {
         printf("  未找到 grape\n");
     }
+
+    // 删除测试
+    //删除存在的key
+    printf("\n删除测试:\n");
+    int ret =skiplist_del(sl,"banana");
+    printf("  删除 banana 结果: %d (期望 1)\n", ret);
+    printf("  当前 size = %d\n", sl->size);
+    node =skiplist_find(sl,"banana");
+    printf("  再次查找 banana: %s\n", node ? "找到了" : "没找到 (正确)");
+
+    // 删除不存在的 key
+    printf("\n删除不存在的 grape:\n");
+    ret =skiplist_del(sl,"grage");
+    printf("  删除 grape 结果: %d (期望 0)\n", ret);
 
     // 测试更新
     printf("\n更新 apple 的 score 为 100\n");

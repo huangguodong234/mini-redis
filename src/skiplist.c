@@ -58,7 +58,7 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
         curr->score =score;
         return;
     }
-
+    
     // 3. member 不存在，创建新节点
     int new_level =random_level();
     // 如果新节点的层数超过当前最大层，更新 max_level
@@ -86,18 +86,83 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
 
 // ==================== 查找节点 ==================== 现在是用循环的方法来查找，O(n),待优化
 // 根据 member 查找节点，返回节点指针，找不到返回 NULL
-SkipNode *skiplist_find(Skiplist *sl, const char *member) {
-    if (!sl || !member) return NULL;
-    // 临时改为在第0层顺序查找（O(n)），后续可优化为哈希表辅助索引
-    SkipNode *curr = sl->header->forward[0];
-    while (curr) {
-        if (strcmp(curr->member, member) == 0) {
-            return curr;
+// 对：返回节点指针 SkipNode*
+SkipNode *skiplist_find(Skiplist *sl, const char *key) {
+    // 原有查找逻辑不变
+    SkipNode *curr = sl->header;
+    for (int i = sl->max_level - 1; i >= 0; i--) {          // 修复：max_level 不是 level
+        while (curr->forward[i] && strcmp(curr->forward[i]->member, key) < 0) {   // 修复：member 不是 key
+            curr = curr->forward[i];
         }
-        curr = curr->forward[0];
     }
-    return NULL;
+    curr = curr->forward[0];
+    if (curr && strcmp(curr->member, key) == 0) {            // 修复：member 不是 key
+        return curr;
+    }
+    return NULL; // 没找到返回空
 }
+
+// ==================== 删除节点 ====================
+// 根据 member 删除跳表中的节点
+// 成功返回 1，节点不存在返回 0
+int skiplist_del(Skiplist *sl, const char *member) {
+    if(!sl || !member) return 0;
+
+    // 先查找目标节点，获取它的 score
+    SkipNode *target =skiplist_find(sl,member);
+    if(!target) return 0;  // 不存在，直接返回
+    double score =target->score;
+
+    SkipNode *update[SKIPLIST_MAX_LEVEL];
+    SkipNode *curr=sl->header;
+
+    // 1. 从最高层向下，记录每层的前驱节点
+    for(int i=sl->max_level-1;i>=0;i--){
+        // 前进条件：下一个节点存在，
+        //并且 (score更小) 或 (score相同但member字符串更小)
+        while(curr->forward[i] && (curr->forward[i]->score < score || 
+            (curr->forward[i]->score==0 && 
+            strcmp(curr->forward[i]->member ,member)<0)) ){
+                curr=curr->forward[i];
+        }
+        update[i]=curr; // 记录该层前驱
+    }
+
+    // 2. 定位到第0层的目标节点（现在 update[0]->forward[0] 应该就是 target）
+    curr=curr->forward[0];
+    if(curr !=target){
+        return 0;       // 理论上不会发生，防御性检查
+    } 
+
+    // 3. 从各层链表中摘除该节点
+    for(int i=0;i<sl->max_level;i++){
+        if(update[i]->forward[i]==curr){
+            update[i]->forward[i]=curr->forward[i];
+        }
+    }
+
+    // 4. 释放节点内存
+    free(curr->member);
+    free(curr->forward);
+    free(curr);
+    sl->size--;
+
+    // 5. 调整 max_level（如果高层的前驱指针全变成 NULL 了）
+    while(sl->max_level>1 && sl->header->forward[sl->max_level-1]==NULL){
+        sl->max_level--;
+    }
+    return 1;
+}
+
+char **skiplist_range(Skiplist *sl, int start, int stop) {
+    (void)sl;
+    (void)start;
+    (void)stop;
+    char **result = malloc(sizeof(char *));
+    result[0] = NULL;
+    return result;
+}
+
 
 // ==================== 释放跳表 ====================
 void skiplist_free(Skiplist *sl){
@@ -118,20 +183,4 @@ void skiplist_free(Skiplist *sl){
 
     // 3. 释放跳表主体结构
     free(sl);
-}
-
-// ---------- 临时空函数，防止链接错误（后续再实现）----------
-int skiplist_del(Skiplist *sl, const char *member) {
-    (void)sl;
-    (void)member;
-    return 0;
-}
-
-char **skiplist_range(Skiplist *sl, int start, int stop) {
-    (void)sl;
-    (void)start;
-    (void)stop;
-    char **result = malloc(sizeof(char *));
-    result[0] = NULL;
-    return result;
 }
