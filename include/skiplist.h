@@ -8,7 +8,7 @@ typedef struct SkipNode{
     char *member;                  //成员名
     double score;                 //跳表中所有节点按 score 从小到大排列。  
     struct SkipNode **forward;     //forward[i] 的含义：在第 i 层上，
-                                   //指向下一个 score 大于本节点的节点。
+                                   //指向当前的下一个 score 大于本节点的节点。
     int level;                     //这个节点有多少层
 }SkipNode;
 
@@ -29,7 +29,7 @@ Skiplist *skiplist_create(void);
 // score: 节点排序分数，跳表按score升序排列
 void skiplist_add(Skiplist *sl,const char *member,double score);
 
-// 根据成员名删除跳表中的节点
+// 根据成员名删除跳表中的节点（暂时不需要实现，先声明）
 // sl: 跳表结构体指针
 // member: 待删除的成员名
 // 返回值：删除成功返回1，节点不存在/失败返回0
@@ -41,6 +41,10 @@ int skiplist_del(Skiplist *sl,const char *member);
 // stop: 结束下标
 // 返回值：字符串数组，存放区间内所有member；需调用方手动释放内存
 char **skiplist_range(Skiplist *sl,int start,int stop);
+
+// 根据成员名查找节点
+// 返回值：成功返回节点指针，找不到返回 NULL
+SkipNode *skiplist_find(Skiplist *sl,const char *member);  // 修正：加上分号，返回类型改为 SkipNode *
 
 // 释放整个跳表所有节点及内存，防止内存泄漏
 // sl: 待销毁的跳表结构体指针
