@@ -1,18 +1,11 @@
 #ifndef ZSET_H
 #define ZSET_H
+#include "skiplist.h"   // 引入跳表定义
 
-// 有序集合节点（排序链表版本)
-typedef struct ZSetNode {
-    char *member;          // 成员名（key）
-    double score;          // 分数（排序依据）
-    struct ZSetNode *next; // 指向下一个节点
-} ZSetNode;
-
-// 有序集合结构体
-typedef struct {
-    ZSetNode *head;  // 链表头指针
-    int size;        // 元素个数
-} ZSet;
+// 有序集合节点(排序链表版本加入跳表）
+typedef struct{
+    Skiplist *sl;   // 跳表指针
+}ZSet;
 
 // 创建有序集合
 ZSet *zset_create(void);

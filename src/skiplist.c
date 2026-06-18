@@ -122,7 +122,7 @@ int skiplist_del(Skiplist *sl, const char *member) {
         //并且 (score更小) 或 (score相同但member字符串更小)
         while(curr->forward[i] && (curr->forward[i]->score < score || 
             (curr->forward[i]->score==0 && 
-            strcmp(curr->forward[i]->member ,member)<0)) ){
+            strcmp(curr->forward[i]->member ,member)<0))){
                 curr=curr->forward[i];
         }
         update[i]=curr; // 记录该层前驱
