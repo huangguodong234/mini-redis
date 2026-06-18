@@ -242,6 +242,7 @@ int main() {
 }
     // ---- 清理资源 ----
     printf("\n正在关闭服务器,释放内存...\n");
+    zset_free(global_zset);
     storage_free(store);
     close(server_fd);
     printf("所有资源已释放，再见！\n");
