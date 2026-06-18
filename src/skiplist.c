@@ -154,12 +154,44 @@ int skiplist_del(Skiplist *sl, const char *member) {
     return 1;
 }
 
+// ==================== 范围查询 ====================
+// 按排名从 start 到 stop 返回 member 字符串数组
+// start 和 stop 是索引（从0开始），stop 可以为 -1 表示最后一个
+// 返回的数组以 NULL 结尾，调用者需要释放数组中每个字符串以及数组本身
+//有更快的方法，在每个节点额外存储 span 信息，但我们先简化
 char **skiplist_range(Skiplist *sl, int start, int stop) {
-    (void)sl;
-    (void)start;
-    (void)stop;
-    char **result = malloc(sizeof(char *));
-    result[0] = NULL;
+    if(!sl){
+        char **result=malloc(sizeof(char*));
+        result[0]=NULL;
+        return result;
+    }
+
+    // 修正负数索引
+    if(start<0) start=0;
+    if(stop <0 || stop >=sl->size) stop=sl->size-1;
+
+    // 无效范围
+    if(start >stop || start >=sl->size){
+        char **result=malloc(sizeof(char *));
+        result[0]=NULL;
+        return result;
+    }
+
+    int count=stop-start+1;
+    char **result=malloc(sizeof(char*)*(count +1)); // +1 放 NULL
+
+    // 从头节点第0层走到第一个
+    SkipNode *curr=sl->header->forward[0];
+    for(int i=0;i<start && curr;i++){
+        curr=curr->forward[0];
+    }
+
+    // 收集 count 个元素
+    for(int i=0 ;i<count && curr;i++){
+        result[i]=strdup(curr->member);
+        curr=curr->forward[0];
+    }
+    result[count]=NULL;
     return result;
 }
 

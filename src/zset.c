@@ -19,14 +19,14 @@ void zset_add(ZSet *zset, const char *member, double score) {
     skiplist_add(zset->sl, member, score);
 }
 
-// 范围查询（跳表版本稍后实现，先返回空）
+// 范围查询（跳表版本）
 char **zset_range(ZSet *zset, int start, int stop) {
     if(!zset){
         char **result =malloc(sizeof(char*));
         result[0]=NULL;
         return result;
     }
-    // 调用跳表的范围查询函数（目前在 skiplist.c 中还是空函数）
+
     return skiplist_range(zset->sl,start ,stop);
 }
 
