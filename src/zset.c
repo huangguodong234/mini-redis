@@ -30,6 +30,12 @@ char **zset_range(ZSet *zset, int start, int stop) {
     return skiplist_range(zset->sl,start ,stop);
 }
 
+// 删除成员（委托给跳表）
+int zset_rem(ZSet *zset, const char *member) {
+    if (!zset || !member) return 0;
+    return skiplist_del(zset->sl, member);
+}
+
 // ==================== 释放有序集合 ====================
 void zset_free(ZSet *zset) {
     if(!zset) return;

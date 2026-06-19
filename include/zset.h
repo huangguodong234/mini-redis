@@ -16,8 +16,10 @@ void zset_add(ZSet *zset, const char *member, double score);
 // 范围查询：返回 score 排名在 [start, stop] 之间的 member 列表
 // stop 为 -1 表示到最后一个元素
 // 返回的是动态分配的字符串数组，最后以 NULL 结尾
-
 char **zset_range(ZSet *zset, int start, int stop);
+
+// 删除指定成员，成功返回1，不存在返回0
+int zset_rem(ZSet *zset, const char *member);
 
 // 释放有序集合
 void zset_free(ZSet *zset);

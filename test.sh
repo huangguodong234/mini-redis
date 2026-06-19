@@ -121,6 +121,22 @@ else
     echo "  [FAIL] ZRANGE 0 0 (got: '$R')"; FAIL=$((FAIL+1))
 fi
 
+# ==================== ZREM 删除 ====================
+R=$(redis-cli -h $HOST -p $PORT ZREM myzset banana 2>/dev/null)
+if [ "$R" = "1" ]; then
+    echo "  [PASS] ZREM banana"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZREM banana (got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# ==================== ZREM 删除不存在的 ====================
+R=$(redis-cli -h $HOST -p $PORT ZREM myzset banana 2>/dev/null)
+if [ "$R" = "0" ]; then
+    echo "  [PASS] ZREM banana again"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZREM banana again (got: '$R')"; FAIL=$((FAIL+1))
+fi
+
 echo ""
 
 # ==================== 最终结果统计 ====================

@@ -63,6 +63,23 @@ void handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(�
         return;
     }
 
+    // ZREM 命令-从有序集合中删除指定成员
+    if(strcasecmp(cmd_name,"ZREM")==0){
+        // 参数：ZREM key member
+        if(cmd->argc !=3){
+            send_response(client_fd, "-ERR wrong number of arguments for 'ZREM'\r\n");
+            return;
+        }
+        char *key=cmd->argv[0];
+        (void)key;
+        char *member=cmd->argv[2];
+        int result=zset_rem(zset,member);
+        char response[16];
+        snprintf(response,sizeof(response),":%d\r\n",result);
+        send_response(client_fd,response);
+        return;
+    }
+
     // ZRANGE 命令(按顺序返回，按索引范围返回有序集合成员)
     if(strcasecmp(cmd_name,"ZRANGE")==0){
         // 参数：ZRANGE key start stop
@@ -97,7 +114,6 @@ void handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(�
         }
         free(member);
         return;
-
     }
 
     // 比较命令名，忽略大小写（SET / set / Set 都行）
