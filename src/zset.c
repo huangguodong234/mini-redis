@@ -19,6 +19,19 @@ void zset_add(ZSet *zset, const char *member, double score) {
     skiplist_add(zset->sl, member, score);
 }
 
+// 删除成员（委托给跳表）
+int zset_rem(ZSet *zset, const char *member) {
+    if (!zset || !member) return 0;
+    return skiplist_del(zset->sl, member);
+}
+
+//指定成员 member 对应的分数（score）。
+double zset_score(ZSet *zset,const char *member){
+    if(!zset || !member) return -1.0;
+    SkipNode * node=skiplist_find(zset->sl,member);
+    return node ? node->score:-1.0;   // 不存在返回 -1
+}
+
 // 范围查询（跳表版本）
 char **zset_range(ZSet *zset, int start, int stop) {
     if(!zset){
@@ -30,11 +43,7 @@ char **zset_range(ZSet *zset, int start, int stop) {
     return skiplist_range(zset->sl,start ,stop);
 }
 
-// 删除成员（委托给跳表）
-int zset_rem(ZSet *zset, const char *member) {
-    if (!zset || !member) return 0;
-    return skiplist_del(zset->sl, member);
-}
+
 
 // ==================== 释放有序集合 ====================
 void zset_free(ZSet *zset) {

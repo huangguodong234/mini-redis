@@ -80,6 +80,28 @@ void handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(�
         return;
     }
 
+    //ZSCORE命令 指定成员 member 对应的分数（score）
+    if(strcasecmp(cmd_name,"ZSCORE")==0){
+        if(cmd->argc!=3){
+            send_response(client_fd, "-ERR wrong number of arguments for 'ZSCORE'\r\n");
+            return;
+        }
+        char *key=cmd->argv[1];
+        (void)key;
+        char *member=cmd->argv[2];
+        double score=zset_score(zset,member);
+        if(score ==-1.0){
+            send_response(client_fd, "$-1\r\n");   // nil
+        }else{
+            char buf[64];
+            snprintf(buf,sizeof(buf),"%g",score);
+            char response[128];
+            snprintf(response,sizeof(response),"$%zu\r\n%s\r\n",strlen(buf),buf);
+            send_response(client_fd,response);
+        }
+        return;
+    }
+
     // ZRANGE 命令(按顺序返回，按索引范围返回有序集合成员)
     if(strcasecmp(cmd_name,"ZRANGE")==0){
         // 参数：ZRANGE key start stop

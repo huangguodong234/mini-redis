@@ -36,30 +36,50 @@ Skiplist *skiplist_create(void){
     return sl;
 }
 
+// ==================== 查找节点 ==================== 现在是用循环的方法来查找，O(n),待优化
+// 根据 member 查找节点，返回节点指针，找不到返回 NULL
+// 对：返回节点指针 SkipNode*
+SkipNode *skiplist_find(Skiplist *sl, const char *member) {
+    if(!sl || !member) return NULL;
+    // 在第0层顺序查找（按 member 精确匹配）
+    SkipNode *curr=sl->header->forward[0];
+    while(curr){
+        if(strcmp(curr->member,member)==0){
+            return curr;
+        }
+        curr=curr->forward[0];
+    }
+    return NULL;
+}
+
 // ==================== 插入/更新 ====================
 void skiplist_add(Skiplist *sl,const char*member,double score){
+    //先检查member是否存在，再记录前驱指针
+    //防止删除节点时删掉的节点刚好是前驱指针
+    //避免插入时前驱指针指向已删除的内存
+
+    // 1. 检查 member 是否已存在（用 skiplist_find 按 member 查找）
+    SkipNode *existing=skiplist_find(sl,member);
+    if(existing){
+        if(existing->score==score) return ;
+        else{
+            skiplist_del(sl,member); //删除旧节点（重新排序）
+        }
+    }
+
     // update[i] 记录在第 i 层，新节点应该插在谁后面
     SkipNode *update[SKIPLIST_MAX_LEVEL];
     SkipNode *curr =sl->header;
 
-    // 1. 从最高层往下查找，记录每层的前驱节点
+    // 2. 从最高层往下查找，记录每层的前驱节点
     for(int i=sl->max_level -1;i>=0;i--){          // 修复：i-- 而不是 i++
         while(curr ->forward[i] && curr->forward[i]->score <score){
             curr=curr->forward[i];
         }
         update[i]=curr;  // 该层的前驱指针
     }
-
-    // 到达第0层，curr->forward[0] 就是第一个 score >= 目标的位置
-    // 2. 检查 member 是否已存在
-    curr=curr->forward[0];
-    if(curr && curr->score ==score && strcmp(curr->member,member)==0){
-        // member 已存在，更新 score（简化处理，不重新排序）
-        curr->score =score;
-        return;
-    }
-    
-    // 3. member 不存在，创建新节点
+   
+    // 3. member 不存在（或被删除了），创建新节点
     int new_level =random_level();
     // 如果新节点的层数超过当前最大层，更新 max_level
     if(new_level >sl->max_level){
@@ -82,24 +102,6 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
         update[i]->forward[i]=new_node;              // 前驱指向新节点
     }
     sl->size++;
-}
-
-// ==================== 查找节点 ==================== 现在是用循环的方法来查找，O(n),待优化
-// 根据 member 查找节点，返回节点指针，找不到返回 NULL
-// 对：返回节点指针 SkipNode*
-SkipNode *skiplist_find(Skiplist *sl, const char *key) {
-    // 原有查找逻辑不变
-    SkipNode *curr = sl->header;
-    for (int i = sl->max_level - 1; i >= 0; i--) {          // 修复：max_level 不是 level
-        while (curr->forward[i] && strcmp(curr->forward[i]->member, key) < 0) {   // 修复：member 不是 key
-            curr = curr->forward[i];
-        }
-    }
-    curr = curr->forward[0];
-    if (curr && strcmp(curr->member, key) == 0) {            // 修复：member 不是 key
-        return curr;
-    }
-    return NULL; // 没找到返回空
 }
 
 // ==================== 删除节点 ====================
@@ -194,7 +196,6 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
     result[count]=NULL;
     return result;
 }
-
 
 // ==================== 释放跳表 ====================
 void skiplist_free(Skiplist *sl){

@@ -88,7 +88,7 @@ echo "$R" | grep -qi "unknown" && { echo "  [PASS] UNKNOWN"; PASS=$((PASS+1)); }
 # ---------- 有序集合 ----------
 echo "--- 3. 有序集合 (ZADD / ZRANGE) ---"
 
-# ==================== ZADD 第一个元素 ====================
+# ==================== 添加ZADD 第一个元素 ====================
 R=$(redis-cli -h $HOST -p $PORT ZADD myzset 10 apple 2>/dev/null)
 if [ "$R" = "OK" ] || [ "$R" = "1" ]; then
     echo "  [PASS] ZADD apple"; PASS=$((PASS+1))
@@ -96,12 +96,43 @@ else
     echo "  [FAIL] ZADD apple (got: '$R')"; FAIL=$((FAIL+1))
 fi
 
-# ==================== ZADD 第二个元素 ====================
+# ==================== 添加ZADD 第二个元素 ====================
 R=$(redis-cli -h $HOST -p $PORT ZADD myzset 5 banana 2>/dev/null)
 if [ "$R" = "OK" ] || [ "$R" = "1" ]; then
     echo "  [PASS] ZADD banana"; PASS=$((PASS+1))
 else
     echo "  [FAIL] ZADD banana (got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# ==================== ZADD 更新（同一 member 不同 score） ====================
+R=$(redis-cli -h $HOST -p $PORT ZADD myzset 20 apple 2>/dev/null)
+if [ "$R" = "OK" ] || [ "$R" = "0" ]; then
+    echo "  [PASS] ZADD update apple"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZADD update apple (got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# ==================== ZSCORE 测试 ====================
+R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset banana 2>/dev/null)
+if [ "$R" = "5" ]; then
+    echo "  [PASS] ZSCORE banana"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZSCORE banana (got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset apple 2>/dev/null)
+if [ "$R" = "20" ]; then
+    echo "  [PASS] ZSCORE apple"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZSCORE apple (got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# ZSCORE 不存在的 member
+R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset cherry 2>/dev/null)
+if [ -z "$R" ]; then
+    echo "  [PASS] ZSCORE miss"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZSCORE miss (got: '$R')"; FAIL=$((FAIL+1))
 fi
 
 # ==================== ZRANGE 查询全部 ====================
@@ -120,6 +151,8 @@ if echo "$R" | grep -q "banana" && ! echo "$R" | grep -q "apple"; then
 else
     echo "  [FAIL] ZRANGE 0 0 (got: '$R')"; FAIL=$((FAIL+1))
 fi
+
+
 
 # ==================== ZREM 删除 ====================
 R=$(redis-cli -h $HOST -p $PORT ZREM myzset banana 2>/dev/null)
