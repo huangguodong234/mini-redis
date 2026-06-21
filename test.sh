@@ -24,6 +24,16 @@ trap "kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null" EXIT
 # 都会自动执行后面的命令：杀掉服务进程
 # 作用：**保证测试完一定关掉服务，不残留进程**
 
+# ==================== PING 测试 ====================
+echo "--- 0. 连接测试 ---"
+R=$(redis-cli -h $HOST -p $PORT PING 2>/dev/null)
+if [ "$R" = "PONG" ]; then
+    echo "  [PASS] PING"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] PING (got: '$R')"; FAIL=$((FAIL+1))
+fi
+echo ""
+
 # ---------- 基本命令 ----------
 echo "--- 1. 基本命令 ---"  # 打印：第一组测试开始
 
@@ -38,18 +48,18 @@ R=$(redis-cli -h $HOST -p $PORT SET name zhangsan 2>/dev/null)
 
 [ "$R" = "ok" ] && { echo "  [PASS] SET"; PASS=$((PASS+1)); } || { echo "  [FAIL] SET (got: '$R')"; FAIL=$((FAIL+1)); }
 # 这一行是简写的 判断 + 输出 + 计数
-# 如果 R 等于 "OK" → 打印 PASS，通过数+1
-# 否则 → 打印 FAIL，失败数+1
+# 如果 R 等于 "OK" → 打印 PASS,通过数+1
+# 否则 → 打印 FAIL,失败数+1
 
 # ==================== GET 测试 ====================
 R=$(redis-cli -h $HOST -p $PORT GET name 2>/dev/null)
 [ "$R" = "zhangsan" ] && { echo "  [PASS] GET"; PASS=$((PASS+1)); } || { echo "  [FAIL] GET (got: '$R')"; FAIL=$((FAIL+1)); }
-# 测试：获取刚才存的 name，期望得到 zhangsan
+# 测试：获取刚才存的 name,期望得到 zhangsan
 
 # ==================== GET 不存在的 key ====================
 R=$(redis-cli -h $HOST -p $PORT GET nokey 2>/dev/null)
 [ -z "$R" ] && { echo "  [PASS] GET miss"; PASS=$((PASS+1)); } || { echo "  [FAIL] GET miss (got: '$R')"; FAIL=$((FAIL+1)); }
-# [ -z "$R" ] 意思是：R 为空字符串
+# [ -z "$R" ] 意思是:R 为空字符串
 # 期望：获取不存在的 key → 返回空
 
 # ==================== DEL 删除 ====================
@@ -104,7 +114,7 @@ else
     echo "  [FAIL] ZADD banana (got: '$R')"; FAIL=$((FAIL+1))
 fi
 
-# ==================== ZADD 更新（同一 member 不同 score） ====================
+# ============ ZADD 更新（同一 member 不同 score） ====================
 R=$(redis-cli -h $HOST -p $PORT ZADD myzset 20 apple 2>/dev/null)
 if [ "$R" = "OK" ] || [ "$R" = "0" ]; then
     echo "  [PASS] ZADD update apple"; PASS=$((PASS+1))
@@ -127,13 +137,13 @@ else
     echo "  [FAIL] ZSCORE apple (got: '$R')"; FAIL=$((FAIL+1))
 fi
 
-# ZSCORE 不存在的 member
 R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset cherry 2>/dev/null)
 if [ -z "$R" ]; then
     echo "  [PASS] ZSCORE miss"; PASS=$((PASS+1))
 else
     echo "  [FAIL] ZSCORE miss (got: '$R')"; FAIL=$((FAIL+1))
 fi
+     
 
 # ==================== ZRANGE 查询全部 ====================
 R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset 0 -1 2>/dev/null)
