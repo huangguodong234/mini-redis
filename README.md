@@ -71,10 +71,13 @@ OS：RHEL 8.10
 1000000	GET	      474.08s	    2109	         409.88s	  2439
 
 有序集合（跳表）redis-benchmark 压测（10 并发，10 万请求）
-命令	                            QPS
-ZADD 类比 (SADD)	               2524
-ZRANGE 类比 (LRANGE_100)	       2482
-综合	                           2300 ~ 2600
+命令	                   QPS	          说明
+PING_INLINE	              2460	      连接存活检测
+SET	                      2535	      字符串存储
+GET	                      2427	      字符串查询
+SADD	                  2384	      集合添加（类比 ZADD）
+LRANGE_100	              2010	      范围查询（类比 ZRANGE）
+MSET (10 keys)	          1441	      批量存储
 
 🏗️ 项目架构
 mini-redis/
