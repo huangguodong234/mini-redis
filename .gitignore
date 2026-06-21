@@ -1,0 +1,13 @@
+# 编译产物
+*.o
+server
+test_skiplist
+test_zset
+test_hash
+test_hashtable
+test_resize
+bench_client
+
+# 临时文件
+hB
+/tmp

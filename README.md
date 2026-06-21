@@ -12,10 +12,10 @@
 ```bash
 make clean && make
 
-运行服务器
+### 运行服务器
 ./server
 
-用 redis-cli 连接测试
+### 用 redis-cli 连接测试
 redis-cli -h 127.0.0.1 -p 6379
 127.0.0.1:6379> SET name zhangsan
 OK
@@ -24,7 +24,20 @@ OK
 127.0.0.1:6379> DEL name
 (integer) 1
 
-### 📊 性能测试
+### 有序集合操作
+127.0.0.1:6379> ZADD myzset 10 apple
+OK
+127.0.0.1:6379> ZADD myzset 5 banana
+OK
+127.0.0.1:6379> ZRANGE myzset 0 -1
+1) "banana"
+2) "apple"
+127.0.0.1:6379> ZSCORE myzset apple
+"10"
+127.0.0.1:6379> ZREM myzset banana
+(integer) 1
+
+📊 性能测试
 测试环境
 CPU：VMware 虚拟机
 
@@ -57,35 +70,49 @@ OS：RHEL 8.10
 1000000	SET	      531.86s	    1880	         407.45s	  2454
 1000000	GET	      474.08s	    2109	         409.88s	  2439
 
-## 🏗️ 项目架构
+有序集合（跳表）redis-benchmark 压测（10 并发，10 万请求）
+命令	                            QPS
+ZADD 类比 (SADD)	               2524
+ZRANGE 类比 (LRANGE_100)	       2482
+综合	                           2300 ~ 2600
+
+🏗️ 项目架构
 mini-redis/
+├── archive/ # 归档旧版测试文件
 ├── include/
-│   ├── protocol.h      # 协议解析接口
-│   ├── storage.h        # 存储层接口
-│   └── hashtable.h      # 哈希表接口
+│ ├── protocol.h # 协议解析接口
+│ ├── storage.h # 存储层接口
+│ ├── hashtable.h # 哈希表接口
+│ ├── skiplist.h # 跳表接口
+│ └── zset.h # 有序集合接口
 ├── src/
-│   ├── server.c         # 服务器主程序（Socket + 事件循环）
-│   ├── protocol.c       # RESP 协议解析器
-│   ├── storage.c        # 存储层（封装哈希表）
-│   ├── hashtable.c      # 哈希表实现（djb2 + 链地址法）
-│   ├── test_hash.c      # 哈希分布测试
-│   ├── test_client.c    # 功能测试客户端
-│   └── bench_client.c   # 原生 C 压测客户端
+│ ├── server.c # 服务器主程序（Socket + 事件循环）
+│ ├── protocol.c # RESP 协议解析器
+│ ├── storage.c # 存储层（封装哈希表）
+│ ├── hashtable.c # 哈希表实现（djb2 + 链地址法）
+│ ├── skiplist.c # 跳表实现
+│ ├── zset.c # 有序集合（封装跳表）
+│ ├── bench_client.c # 原生 C 压测客户端
+│ ├── test_resize.c # 哈希表扩容测试
+│ ├── test_skiplist.c # 跳表功能测试
+│ └── test_zset.c # 有序集合测试
+├── test.sh # 自动化回归测试脚本（23 用例）
 ├── Makefile
 └── README.md
 
-## 架构分层
-┌─────────────────────────┐
-│   网络层 (server.c)      │  ← Socket 通信、事件循环
-├─────────────────────────┤
-│   协议层 (protocol.c)   │  ← RESP 协议解析
-├─────────────────────────┤
-│   存储层 (storage.c)    │  ← 封装哈希表操作
-├─────────────────────────┤
-│   数据结构层 (hashtable.c) │  ← djb2 哈希 + 链地址法
-└─────────────────────────┘
+架构分层
+┌─────────────────────────────┐
+│   网络层 (server.c)          │  ← Socket 通信、事件循环
+├─────────────────────────────┤
+│   协议层 (protocol.c)        │  ← RESP 协议解析
+├─────────────────────────────┤
+│   存储层 (storage.c / zset.c)│  ← 封装哈希表与有序集合操作
+├─────────────────────────────┤
+│   数据结构层                 │
+│   (hashtable.c / skiplist.c) │  ← djb2 哈希 + 链地址法 / 跳表
+└─────────────────────────────┘
 
-## 🧠 核心技术点
+🧠 核心技术点
 已实现
 TCP 服务器（socket/bind/listen/accept）
 
@@ -97,22 +124,26 @@ djb2 哈希函数
 
 链地址法哈希表
 
+哈希表自动扩容（负载因子触发）
+
 哈希表替代动态数组，性能提升 > 10,000 倍
 
 valgrind 零内存泄漏
 
 SIGINT 信号处理，优雅退出
 
+有序集合 (ZADD, ZRANGE, ZREM, ZSCORE) 基于跳表
+
+跳表概率层级、插入/删除 O(log n)
+
 待实现
-哈希表自动扩容（负载因子触发）
-
-有序集合（ZADD/ZRANGE/ZREM），基于跳表
-
 AOF 持久化
 
 多客户端并发（epoll）
 
-##📝 开发日志
+哈希表+跳表混合索引优化 member 精确查找
+
+📝 开发日志
 阶段 1：启动与存储（5.28 - 5.31）
 从零搭建 TCP echo 服务器
 
@@ -127,10 +158,16 @@ AOF 持久化
 
 性能测试：哈希表比动态数组快 10,000 倍
 
-阶段 3：进阶与深化（6.8 - 暑假）
-跳表实现有序集合
+阶段 3：有序集合（6.13 - 6.25）
+排序链表暴力实现 ZADD/ZRANGE，感受 O(n) 插入
 
-代码模块化与文档完善
+搭建跳表框架，实现插入/查找/删除/范围查询
+
+集成到服务器，支持 ZADD/ZRANGE/ZREM/ZSCORE
+
+自动化测试 23/23 全部通过
+
+redis-benchmark 压测 QPS 稳定 2300+
 
 🛠️ 开发工具
 编译器：gcc
@@ -145,4 +182,3 @@ AOF 持久化
 
 📄 许可证
 MIT License
-EOF
