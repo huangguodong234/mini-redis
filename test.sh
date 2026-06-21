@@ -96,7 +96,7 @@ echo "$R" | grep -qi "unknown" && { echo "  [PASS] UNKNOWN"; PASS=$((PASS+1)); }
 # 期望报错包含 unknown
 
 # ---------- 有序集合 ----------
-echo "--- 3. 有序集合 (ZADD / ZRANGE) ---"
+echo "--- 3. 有序集合  ---"
 
 # ==================== 添加ZADD 第一个元素 ====================
 R=$(redis-cli -h $HOST -p $PORT ZADD myzset 10 apple 2>/dev/null)
@@ -180,9 +180,50 @@ else
     echo "  [FAIL] ZREM banana again (got: '$R')"; FAIL=$((FAIL+1))
 fi
 
+# ==================== 边界测试 ====================
+echo "--- 4 . 边界测试 ---"
+# 1. ZADD 相同 member 相同 score
+R=$(redis-cli -h $HOST -p $PORT ZADD myzset 20 apple 2>/dev/null)
+if [ "$R" = "OK" ] || [ "$R" = "0" ]; then
+    echo " [PASS] ZADD same member same score";PASS=$((PASS+1))
+else
+    echo " [FAIL] ZADD same member same score(got: '$R')";FAIL=$((FAIL+1))
+fi
+
+# 确认 score 没变
+R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset apple 2>/dev/null)
+if [ "$R" = "20" ]; then
+    echo " [PASS] ZSCORE apple still 20";PASS=$((PASS+1))
+else    
+    echo " [FAIL] ZSCORE apple still 20(got: '$R')";FAIL=$((FAIL+1))
+fi    
+
+# 2. ZRANGE 负数索引（先添加两个元素）
+R=$(redis-cli -h $HOST -p $PORT ZADD myzset 30 cherry 2>/dev/null)
+R=$(redis-cli -h $HOST -p $PORT ZADD myzset 40 date 2>/dev/null)
+R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset -2 -1 2>/dev/null)
+if echo "$R" | grep -q "cherry" && echo "$R" | grep -q "date"; then
+    echo " [PASS] ZRANGE -2 -1";PASS=$((PASS+1))
+else
+    echo " [FAIL] ZRANGE -2 -1";FAIL=$((FAIL+1))
+fi        
+
+# 3. ZRANGE 超出范围索引（应返回空）
+R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset 10 20 2>/dev/null)
+# 空输出或 (empty array) 都算通过，简单判断不包含已知元素
+if ! echo "$R" | grep -q "apple"; then
+    echo "  [PASS] ZRANGE out of range (empty)"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZRANGE out of range (got: '$R')"; FAIL=$((FAIL+1))
+fi
+
 echo ""
 
 # ==================== 最终结果统计 ====================
+# 确保 cherry date 不存在（防止之前测试残留）
+redis-cli -h $HOST -p $PORT ZREM myzset cherry 2>/dev/null > /dev/null
+redis-cli -h $HOST -p $PORT ZREM myzset date 2>/dev/null > /dev/null
+
 TOTAL=$((PASS+FAIL))            # 总用例数 = 通过 + 失败
 echo "=== 结果: $PASS/$TOTAL 通过 ==="  # 打印成绩
 

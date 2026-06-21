@@ -61,7 +61,7 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
     // 1. 检查 member 是否已存在（用 skiplist_find 按 member 查找）
     SkipNode *existing=skiplist_find(sl,member);
     if(existing){
-        if(existing->score==score) return ;
+        if(existing->score==score) return;
         else{
             skiplist_del(sl,member); //删除旧节点（重新排序）
         }
@@ -168,9 +168,13 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
         return result;
     }
 
-    // 修正负数索引
-    if(start<0) start=0;
-    if(stop <0 || stop >=sl->size) stop=sl->size-1;
+    // 将负数索引转换为正数（Redis 风格）
+    if(start < 0) start=sl->size + start;
+    if(stop < 0) stop=sl->size + stop;
+
+    // 边界修正
+    if(start < 0) start = 0;
+    if(stop < 0) stop =0;
 
     // 无效范围
     if(start >stop || start >=sl->size){
@@ -178,6 +182,9 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
         result[0]=NULL;
         return result;
     }
+
+    //修正 stop 超出上界
+    if (stop >= sl->size) stop = sl->size - 1;
 
     int count=stop-start+1;
     char **result=malloc(sizeof(char*)*(count +1)); // +1 放 NULL
