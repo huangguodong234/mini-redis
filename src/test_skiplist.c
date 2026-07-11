@@ -42,7 +42,7 @@ int main() {
 
     // 删除不存在的 key
     printf("\n删除不存在的 grape:\n");
-    ret =skiplist_del(sl,"grage");
+    ret =skiplist_del(sl,"grape");
     printf("  删除 grape 结果: %d (期望 0)\n", ret);
 
     // 测试更新

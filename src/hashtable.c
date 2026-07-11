@@ -120,9 +120,14 @@ void hashtable_set(HashTable *ht,const char *key,const char *value){
     HashNode *curr=ht ->buckets[index];
     while (curr){
         if(strcmp(curr->key , key)==0){
-            // 已存在，更新 value
+            // 已存在，更新 value（先 strdup 再 free，避免 strdup 失败丢数据）
+            char *new_val =strdup(value);
+            if(!new_val){
+                fprintf(stderr, "hashtable_set: strdup value 失败\n");
+                return;   // 旧 value 保留，程序继续跑
+            }
             free(curr->value);
-            curr->value =strdup(value);
+            curr->value =new_val;
             return;
         }
         curr =curr->next;
@@ -135,7 +140,18 @@ void hashtable_set(HashTable *ht,const char *key,const char *value){
         return;
     }
     new_node ->key =strdup(key);
+    if(!new_node->key){
+        fprintf(stderr, "hashtable_set: strdup key 失败\n");
+        free(new_node);
+        return;
+    }
     new_node ->value=strdup(value);
+    if(!new_node->value){
+        fprintf(stderr, "hashtable_set: strdup value 失败\n");
+        free(new_node->key);
+        free(new_node);
+        return;
+    }
     new_node ->next =ht ->buckets[index];     // 新节点指向原头节点
     ht ->buckets[index]=new_node;             // 桶指向新节点
     ht ->size++;

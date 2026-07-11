@@ -111,6 +111,11 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
         return;
     }
     new_node ->member=strdup(member);
+    if(!new_node->member){
+        fprintf(stderr, "skiplist_add: strdup member 失败\n");
+        free(new_node);
+        return;
+    }
     new_node ->score=score;
     new_node ->level=new_level;
     new_node ->forward=malloc(sizeof(SkipNode *)*new_level);
