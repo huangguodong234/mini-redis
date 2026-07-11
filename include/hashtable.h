@@ -21,7 +21,7 @@ typedef struct{
 unsigned long hash_djb2(const char *str);
 
 // 创建哈希表，initial_capacity 是初始桶数
-HashTable *hashtable_creat(int inital_capacity);
+HashTable *hashtable_create(int initial_capacity);
 
 //插入或更新键值对-SET命令
 void hashtable_set(HashTable *ht,const char*key,const char *value);

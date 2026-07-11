@@ -7,8 +7,17 @@
 // 初始化存储引擎
 Storage *storage_init() {
     Storage *s=malloc(sizeof(Storage));
+    if(!s){
+        fprintf(stderr, "storage_init: malloc Storage 失败\n");
+        return NULL;
+    }
     // 创建初始容量为 16 的哈希表（容量会自动扩容）
-    s->ht = hashtable_creat(16);
+    s->ht = hashtable_create(16);
+    if(!s->ht){
+        fprintf(stderr, "storage_init: hashtable_create 失败\n");
+        free(s);
+        return NULL;
+    }
     return s;
 }
 

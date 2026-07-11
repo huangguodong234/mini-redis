@@ -25,7 +25,6 @@ static const char *skip_crlf(const char*p){
     return p;            
 }
 
-
 Command *parse_command(const char *input)
 {
     //如果输入为空或首字符不是 '*' 就报错
@@ -37,8 +36,13 @@ Command *parse_command(const char *input)
 
     // 分配 Command 结构体
     Command *cmd =(Command*)malloc(sizeof(Command));
+    if(!cmd) return NULL;
     cmd ->argc=argc; //记录参数个数
-    cmd->argv=(char **)malloc(sizeof(char*)*argc);
+    cmd->argv=calloc(argc, sizeof(char*));  // calloc 零初始化，避免 fail 标签 free 野指针
+    if(!cmd->argv){
+        free(cmd);
+        return NULL;
+    }
 
     // 循环解析每一个参数字符串
     for(int i=0;i<argc;i++){
@@ -50,6 +54,7 @@ Command *parse_command(const char *input)
         p=skip_crlf(p);
 
         cmd->argv[i]=malloc(len +1);
+        if(!cmd->argv[i]) goto fail;
         strncpy(cmd->argv[i],p,len);    // 复制 len 个字符
         cmd->argv[i][len]='\0';
         p+=len;                 //// 移动指针到当前字符串末尾

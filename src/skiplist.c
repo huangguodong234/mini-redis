@@ -19,17 +19,32 @@ static int random_level(void){
 // ==================== 创建跳表 ====================
 Skiplist *skiplist_create(void){
     Skiplist *sl =malloc(sizeof(Skiplist));
+    if(!sl){
+        fprintf(stderr, "skiplist_create: malloc Skiplist 失败\n");
+        return NULL;
+    }
     sl->size=0;
     sl->max_level =1;    // 初始只有第0层
 
     // 创建头节点：不存数据，拥有最大层数
     sl->header =malloc(sizeof(SkipNode));
+    if(!sl->header){
+        fprintf(stderr, "skiplist_create: malloc header 失败\n");
+        free(sl);
+        return NULL;
+    }
     sl->header->member =NULL;
     sl->header->score = 0.0;
     sl->header->level =SKIPLIST_MAX_LEVEL;
 
     // 分配头节点的 forward 数组（SKIPLIST_MAX_LEVEL 个指针）
     sl->header->forward=malloc(sizeof(SkipNode *) *SKIPLIST_MAX_LEVEL);
+    if(!sl->header->forward){
+        fprintf(stderr, "skiplist_create: malloc forward 失败\n");
+        free(sl->header);
+        free(sl);
+        return NULL;
+    }
     for(int i=0;i<SKIPLIST_MAX_LEVEL;i++){
         sl->header->forward[i]=NULL;  // 初始全指向 NULL
     }
@@ -91,10 +106,20 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
 
     // 创建新节点
     SkipNode *new_node =malloc(sizeof(SkipNode));
+    if(!new_node){
+        fprintf(stderr, "skiplist_add: malloc SkipNode 失败\n");
+        return;
+    }
     new_node ->member=strdup(member);
     new_node ->score=score;
     new_node ->level=new_level;
     new_node ->forward=malloc(sizeof(SkipNode *)*new_level);
+    if(!new_node->forward){
+        fprintf(stderr, "skiplist_add: malloc forward 失败\n");
+        free(new_node->member);
+        free(new_node);
+        return;
+    }
 
     // 4. 更新各层指针（链表插入操作）
     for(int i=0;i<new_level;i++){ 
@@ -123,7 +148,7 @@ int skiplist_del(Skiplist *sl, const char *member) {
         // 前进条件：下一个节点存在，
         //并且 (score更小) 或 (score相同但member字符串更小)
         while(curr->forward[i] && (curr->forward[i]->score < score || 
-            (curr->forward[i]->score==0 && 
+            (curr->forward[i]->score==score && 
             strcmp(curr->forward[i]->member ,member)<0))){
                 curr=curr->forward[i];
         }
@@ -164,6 +189,7 @@ int skiplist_del(Skiplist *sl, const char *member) {
 char **skiplist_range(Skiplist *sl, int start, int stop) {
     if(!sl){
         char **result=malloc(sizeof(char*));
+        if(!result) return NULL;
         result[0]=NULL;
         return result;
     }
@@ -179,6 +205,7 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
     // 无效范围
     if(start >stop || start >=sl->size){
         char **result=malloc(sizeof(char *));
+        if(!result) return NULL;
         result[0]=NULL;
         return result;
     }
@@ -188,6 +215,7 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
 
     int count=stop-start+1;
     char **result=malloc(sizeof(char*)*(count +1)); // +1 放 NULL
+    if(!result) return NULL;
 
     // 从头节点第0层走到第一个
     SkipNode *curr=sl->header->forward[0];

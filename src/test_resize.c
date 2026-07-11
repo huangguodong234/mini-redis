@@ -6,7 +6,7 @@ int main()
 {
     printf("=== 哈希表自动扩容测试 ===\n\n");
 
-    HashTable *ht =hashtable_creat(4);
+    HashTable *ht =hashtable_create(4);
     printf("初始容量: %d\n\n", ht->capacity);
 
     //插入key

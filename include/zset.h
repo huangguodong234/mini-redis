@@ -17,7 +17,7 @@ void zset_add(ZSet *zset, const char *member, double score);
 int zset_rem(ZSet *zset, const char *member); 
 
 //指定成员 member 对应的分数（score）。-ZSCORE命令
-double zset_score(ZSet *zset,const char *member);
+double zset_score(ZSet *zset,const char *member,bool *found);
 
 // 范围查询：返回 score 排名在 [start, stop] 之间的 member 列表-ZRANGE命令
 // stop 为 -1 表示到最后一个元素

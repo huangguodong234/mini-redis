@@ -1,9 +1,13 @@
+#define _POSIX_C_SOURCE 200809L 
+//strdup-字符串复制函数 是 POSIX 标准函数，在某些编译环境下可能不可用。
+//通过加宏来启用标准 strdup 
+
 // ============================================================
 // hashtable.c —— mini-redis 哈希表的具体实现
 // ============================================================
-// 采用“链地址法”解决哈希冲突：
+// 采用"链地址法"解决哈希冲突：
 // - 每个桶是一个单向链表
-// - 插入使用“头插法”把新节点插在链表头部
+// - 插入使用"头插法"把新节点插在链表头部
 // - 查找和删除需要遍历对应桶的链表
 
 #include <stdio.h>
@@ -11,9 +15,8 @@
 #include <string.h>
 #include "hashtable.h"
 
-#define LOAD_FACTOR_THRESHOLD 0.75  
-#define _POSIX_C_SOURCE 200809L  //strdup-字符串复制函数 是 POSIX 标准函数，在某些编译环境下可能不可用。
-                                 //通过加宏来启用标准 strdup
+#define LOAD_FACTOR_THRESHOLD 0.75                             
+
 // ==================== djb2 哈希函数 ====================
 // 功能：把任意字符串转换成一个无符号长整数
 // 算法：hash = 5381;  hash = hash * 33 + 下一个字符的ASCII码
@@ -34,14 +37,23 @@ unsigned long hash_djb2(const char *str)
 // ========== 创建哈希表 ==========
 // 参数：initial_capacity 指定初始有多少个桶
 // 返回：指向 HashTable 结构体的指针
-HashTable *hashtable_creat(int initial_capacity){
+HashTable *hashtable_create(int initial_capacity){
     HashTable *ht =malloc(sizeof(HashTable));
+    if(!ht) {
+        fprintf(stderr, "hashtable_create: malloc HashTable 失败\n");
+        return NULL;
+    }
     ht ->capacity =initial_capacity;
     ht ->size =0;
 
     // calloc 分配并清零，所有桶初始为 NULL
     // 这里用来创建桶数组，每个元素初始为 NULL（链表为空）
     ht ->buckets =calloc(initial_capacity,sizeof(HashNode *));
+    if(!ht->buckets){
+        fprintf(stderr, "hashtable_create: calloc buckets 失败\n");
+        free(ht);
+        return NULL;
+    }
     return ht;
 }
 
@@ -55,9 +67,9 @@ static void hashtable_resize(HashTable *ht){
     (double)ht->size/old_capacity);
 
     // 1. 创建新桶数组（全部初始化为 NULL）
-    HashNode **new_buchets =calloc(new_capacity,sizeof(HashNode *));
+    HashNode **new_buckets =calloc(new_capacity,sizeof(HashNode *));
     //可能失败返回 NULL，但未检查。
-    if(!new_buchets){
+    if(!new_buckets){
         fprintf(stderr,"内存分配失败，扩容终止\n");
         return;
     }
@@ -73,8 +85,8 @@ static void hashtable_resize(HashTable *ht){
             int new_index = hash% new_capacity;
 
             // 头插法插入到新桶
-            curr ->next =new_buchets[new_index];
-            new_buchets[new_index]=curr;
+            curr ->next =new_buckets[new_index];
+            new_buckets[new_index]=curr;
 
             // 继续处理下一个
             curr=next;
@@ -83,7 +95,7 @@ static void hashtable_resize(HashTable *ht){
 
     // 3. 释放旧桶数组，更新为新的
     free(ht ->buckets);
-    ht ->buckets =new_buchets;
+    ht ->buckets =new_buckets;
     ht ->capacity =new_capacity;
 }
 
@@ -117,11 +129,15 @@ void hashtable_set(HashTable *ht,const char *key,const char *value){
     }
 
     // 不存在，头插法插入新节点
-    HashNode *nem_node =malloc(sizeof(HashNode));
-    nem_node ->key =strdup(key);
-    nem_node ->value=strdup(value);
-    nem_node ->next =ht ->buckets[index];     // 新节点指向原头节点
-    ht ->buckets[index]=nem_node;             // 桶指向新节点
+    HashNode *new_node =malloc(sizeof(HashNode));
+    if(!new_node){
+        fprintf(stderr, "hashtable_set: malloc HashNode 失败\n");
+        return;
+    }
+    new_node ->key =strdup(key);
+    new_node ->value=strdup(value);
+    new_node ->next =ht ->buckets[index];     // 新节点指向原头节点
+    ht ->buckets[index]=new_node;             // 桶指向新节点
     ht ->size++;
 }
 
