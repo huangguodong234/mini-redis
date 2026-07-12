@@ -1,6 +1,7 @@
 #ifndef ZSET_H
 #define ZSET_H
 #include "skiplist.h"   // 引入跳表定义
+#include <stdbool.h>
 
 // 有序集合节点(排序链表版本加入跳表）
 typedef struct{

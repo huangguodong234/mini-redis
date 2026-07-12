@@ -16,6 +16,7 @@
 #include "zset.h"       
 #include <strings.h>      //snprintf()拼接字符串
 #include <errno.h>        //errno()：全局变量，当系统调用错误时，记录错误的类型
+#include <stdbool.h>
 
 #define PORT 6379         //定死服务器监听的端口号
 #define BACKLOG 10        //等待连接队列的最大长度，
