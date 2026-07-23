@@ -1,6 +1,7 @@
 //服务端流程：创建socket(int domain（地址族）,int type（套接字类型）,int protocol（传输协议）我们填 0-TCP)，绑定端口(bing(套接字描述符,地址结构体指针, 地址结构体的大小)),
 //开始监听（listen（套接字描述符, 等待队列最大长度））接受客户端的连接（accept(监听的套接字描述符，客户端地址结构体指针, 客户端地址长度变量的指针)）,
 //读写数据（read（文件描述符，存放数据的数组，存放的数据的最大字节数-1） write（文件描述符，要发送的数据的数组，要发送的字节数）），挂断（close(要挂断的描述符))
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>      // printf, perror（自定义错误提示字符串）-输出失败原因
 #include <stdlib.h>     // exit（）
 #include <string.h>     // memset（目标内存的起始地址, 要填充的字节值, 填充的字节数)）-初始化函数 , strlen（）  
