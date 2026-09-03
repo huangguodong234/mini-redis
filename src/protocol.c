@@ -6,73 +6,74 @@
 #include <ctype.h>     //isdigit()  判断字符是否是数字
 #include "protocol.h"    //我们自己的头文件
 
-static int  parse_int(const char **p)
- {
-    const char *start=*p;     //记录数字开始位置
-    while(**p && isdigit((unsigned char)**p))      // 只要当前字符是数字就一直向后移动     
-        (*p)++;
-    int len =*p-start;  //计算数字长度
-    char num[16];    //临时数组存放数字字符串
-    strncpy(num,start,len);  // 复制 len 个字符
-    num[len]='\0';      // 手动添加字符串结束符
-    return atoi(num);   //把字符串转成整数返回
-}
+// ===== 公开的辅助函数，供 processMultibulkBuffer 调用 =====
 
-// 辅助函数：跳过 \r\n
-static const char *skip_crlf(const char*p){
-    if(*p=='\r') p++;    // 如果当前字符是回车，跳过一个
-    if(*p=='\n') p++;    //如果当前字符是换行，跳过一个
-    return p;            
-}
+/*
+ * 解析 *N\r\n
+ * 成功返回 1，*next 指向 \r\n 之后的位置，*argc 被填充
+ * 半包返回 0
+ * 协议错误返回 -1
+ */
+int parse_multibulk_header(const char *p, const char **next, int *argc) {
+    if (*p != '*') return -1;                     // 协议错误
+    p++;                                          // 跳过 '*'
+    const char *cr = strchr(p, '\r');             // 找 \r
+    if (!cr) return 0;                            // 半包，数据不全
+    if (*(cr + 1) != '\n') return 0;              // 也是半包，没有完整的 \r\n
 
-Command *parse_command(const char *input)
-{
-    //如果输入为空或首字符不是 '*' 就报错
-    if(!input || *input !='*') return NULL;
-
-    const char *p=input+1;  // 跳过 '*'，指向数组长度部分
-    int argc=parse_int(&p);   // 解析参数个数，并移动 p
-    if(argc <=0 || argc >10) return NULL;   // 参数个数不合法就失败
-
-    // 分配 Command 结构体
-    Command *cmd =(Command*)malloc(sizeof(Command));
-    if(!cmd) return NULL;
-    cmd ->argc=argc; //记录参数个数
-    cmd->argv=calloc(argc, sizeof(char*));  // calloc 零初始化，避免 fail 标签 free 野指针
-    if(!cmd->argv){
-        free(cmd);
-        return NULL;
+    // 解析数字（先判上限再乘 10：n 最大 1024，n*10+9 ≤ 10249，不会 int 溢出）
+    int n = 0;
+    for (const char *q = p; q < cr; q++) {
+        if (*q < '0' || *q > '9') return -1;      // 非法字符，协议错误
+        if (n > 1024) return -1;                  // 提前退出：位数太多，防溢出
+        n = n * 10 + (*q - '0');
     }
+    if (n <= 0 || n > 1024) return -1;              // 参数个数不合理
 
-    // 循环解析每一个参数字符串
-    for(int i=0;i<argc;i++){
-        p=skip_crlf(p);  //跳过 \r\n
-        if(*p !='$') goto fail; // 批量字符串必须以 '$' 开头
-        p++;                      // 跳过 '$'
-        int len =parse_int(&p);  // 解析字符串长度
-        if(len<0) goto fail;
-        p=skip_crlf(p);
-
-        cmd->argv[i]=malloc(len +1);
-        if(!cmd->argv[i]) goto fail;
-        strncpy(cmd->argv[i],p,len);    // 复制 len 个字符
-        cmd->argv[i][len]='\0';
-        p+=len;                 //// 移动指针到当前字符串末尾
-    }return cmd;   // 成功返回命令结
-
-    fail: // 解析过程中任何一步失败就跳到这里清理内存
-    for(int i=0;i<cmd->argc;i++) free(cmd ->argv[i]);
-    free(cmd->argv);
-    free(cmd);
-    return NULL;
+    *argc = n;
+    *next = cr + 2;                               // 指向 \r\n 之后
+    return 1;                                     // 成功
 }
 
-// 释放 Command 占用的所有内存
-void free_command(Command *cmd){
-    if(!cmd) return;   // 空指针检查
-    for(int i=0;i<cmd->argc;i++){
-        free(cmd->argv[i]);
+/*
+ * 解析 $L\r\n
+ * 成功返回 1，*next 指向 \r\n 之后的位置，*len 被填充
+ * 半包返回 0
+ * 协议错误返回 -1
+ */
+int parse_bulk_header(const char *p, const char **next, long *len) {
+    if (*p != '$') return -1;
+    p++;
+    const char *cr = strchr(p, '\r');
+    if (!cr || *(cr + 1) != '\n') return 0;
+
+    long l = 0;
+    for (const char *q = p; q < cr; q++) {
+        if (*q < '0' || *q > '9') return -1;
+        if (l > 512L * 1024 * 1024) return -1;   // 提前退出：防 long 溢出（同 multibulk 的写法）
+        l = l * 10 + (*q - '0');
     }
-    free(cmd->argv);
-    free(cmd);
+    if (l < 0 || l > 512 * 1024 * 1024) return -1;
+
+    *len = l;
+    *next = cr + 2;
+    return 1;
+}
+
+/*
+ * 检查并提取 L 字节内容
+ * p 指向内容开头，len 是内容长度
+ * 如果缓冲区数据还没到齐，返回 0（半包，等待下次 read）
+ * 如果数据已完整但结尾不是 \r\n，返回 -1（协议错误）
+ * 否则提取内容到 *out（调用者负责 free），*next 指向内容末尾之后
+ */
+int extract_bulk_content(const char *p, long len, char **out, const char **next, const char *buf_end) {
+    if (p + len + 2 > buf_end) return 0;                       //半包（数据不够）
+    if (p[len] != '\r' || p[len+1] != '\n') return -1;         //数据够但格式不对 → 协议错误
+    *out = malloc(len + 1);
+    if (!*out) return -1;                                       // malloc 失败按错误处理（避免解引用 NULL）
+    memcpy(*out, p, len);
+    (*out)[len] = '\0';
+    *next = p + len + 2;
+    return 1;
 }

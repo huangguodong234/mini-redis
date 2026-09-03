@@ -9,7 +9,7 @@ echo "=== mini-redis 自动化测试 ==="  # 屏幕打印标题
 echo ""                               # 打印空行，更美观
 
 # 启动服务器
-./server > /tmp/server.log 2>&1 &
+./mini-redis > /tmp/server.log 2>&1 &
 # ./server            运行你写的 Redis 服务
 # > /tmp/server.log   把日志输出到文件，不占屏幕
 # 2>&1                把错误信息也一起输出到文件
@@ -46,7 +46,7 @@ R=$(redis-cli -h $HOST -p $PORT SET name zhangsan 2>/dev/null)
 # SET name zhangsan 发送存储命令
 # 2>/dev/null       屏蔽错误输出（只看结果）
 
-[ "$R" = "ok" ] && { echo "  [PASS] SET"; PASS=$((PASS+1)); } || { echo "  [FAIL] SET (got: '$R')"; FAIL=$((FAIL+1)); }
+[ "$R" = "OK" ] && { echo "  [PASS] SET"; PASS=$((PASS+1)); } || { echo "  [FAIL] SET (got: '$R')"; FAIL=$((FAIL+1)); }
 # 这一行是简写的 判断 + 输出 + 计数
 # 如果 R 等于 "OK" → 打印 PASS,通过数+1
 # 否则 → 打印 FAIL,失败数+1
@@ -154,9 +154,8 @@ else
 fi
 
 # ==================== ZRANGE 索引范围 ====================
-# 只查第一个元素（score最小的），期望只有 banana，不包含 apple
-R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset 0 0 2>/dev/null)
-if echo "$R" | grep -q "banana" && ! echo "$R" | grep -q "apple"; then
+R=$(redis-cli --raw -h $HOST -p $PORT ZRANGE myzset 0 0 2>/dev/null)
+if [ "$R" = "banana" ]; then
     echo "  [PASS] ZRANGE 0 0"; PASS=$((PASS+1))
 else
     echo "  [FAIL] ZRANGE 0 0 (got: '$R')"; FAIL=$((FAIL+1))
@@ -216,6 +215,126 @@ if ! echo "$R" | grep -q "apple"; then
 else
     echo "  [FAIL] ZRANGE out of range (got: '$R')"; FAIL=$((FAIL+1))
 fi
+
+echo ""
+
+# ==================== B3/B9 回归 + inline 命令测试 ====================
+echo "--- 6. B3 参数上限 / B9 参数校验 / inline 命令 ---"
+
+# raw_send: 开一条裸 TCP 连接（/dev/tcp，不依赖 nc），原样发送 $1（可用 \r\n 转义），
+# 读回 1 秒内到达的所有响应行并去掉 \r
+raw_send() {
+    timeout 3 bash -c '
+        exec 3<>/dev/tcp/127.0.0.1/6379 || exit 1
+        printf "%b" "$1" >&3
+        out=""
+        while IFS= read -r -t 1 line <&3; do out="$out$line
+"; done
+        printf "%s" "$out"
+    ' _ "$1" 2>/dev/null | tr -d '\r'
+}
+
+raw_test() {
+    # $1=描述  $2=发送的原始数据  $3=期望回复（已去掉 \r，可能多行）
+    local desc="$1" payload="$2" expect="$3"
+    local got
+    got=$(raw_send "$payload")
+    if [ "$got" = "$expect" ]; then
+        echo "  [PASS] $desc"; PASS=$((PASS+1))
+    else
+        echo "  [FAIL] $desc (got: '$got', want: '$expect')"; FAIL=$((FAIL+1))
+    fi
+}
+
+# 1. B3 回归：12 参数命令（修复前直接 protocol error；上限已提至 1024）
+R=$(redis-cli -h $HOST -p $PORT PING a b c d e f g h i j k l 2>/dev/null)
+if [ "$R" = "PONG" ]; then
+    echo "  [PASS] 12-arg PING accepted (B3)"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] 12-arg PING (B3, got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# 2. B3 回归：*2000 头（超过 1024 上限，应报协议错误并断开）
+raw_test "*2000 header rejected" '*2000\r\n' '-ERR protocol error'
+
+# 3. B9 回归：ZADD 垃圾 score（修复前 atof("abc") 静默按 0 处理）
+R=$(redis-cli -h $HOST -p $PORT ZADD myzset abc m1 2>&1)
+if echo "$R" | grep -q "value is not a valid float"; then
+    echo "  [PASS] ZADD invalid score rejected (B9)"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZADD invalid score (B9, got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# 4. B9 回归：ZADD NaN score（修复前 NaN 会永久破坏跳表排序）
+R=$(redis-cli -h $HOST -p $PORT ZADD myzset nan m2 2>&1)
+if echo "$R" | grep -q "value is not a valid float"; then
+    echo "  [PASS] ZADD NaN score rejected (B9)"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZADD NaN score (B9, got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# 5. B9 回归：ZRANGE 垃圾索引（修复前 atoi 不报错）
+R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset a 1 2>&1)
+if echo "$R" | grep -q "value is not an integer or out of range"; then
+    echo "  [PASS] ZRANGE invalid index rejected (B9)"; PASS=$((PASS+1))
+else
+    echo "  [FAIL] ZRANGE invalid index (B9, got: '$R')"; FAIL=$((FAIL+1))
+fi
+
+# 6. inline 命令：经典用法 echo "PING" | nc（不走 RESP 数组协议）
+raw_test "inline PING" 'PING\r\n' '+PONG'
+
+# 7. inline SET
+raw_test "inline SET" 'SET inline_k inline_v\r\n' '+OK'
+
+# 8. inline GET（RESP 响应两行：长度行 + 内容行；inline_v 长 8）
+raw_test "inline GET" 'GET inline_k\r\n' "$(printf '$8\ninline_v')"
+
+# 9. inline 空行：应被跳过而不是协议错误
+raw_test "inline blank line ignored" '\r\nPING\r\n' '+PONG'
+
+# ---------- 半包（split packet）回归 ----------
+# raw_send_split: 先发 $1（前半截），等 $3 秒，再发 $2（后半截）。
+# 模拟 TCP 把一条完整命令拆成两个包到达的场景（半包处理的回归测试）。
+raw_send_split() {
+    timeout 5 bash -c '
+        exec 3<>/dev/tcp/127.0.0.1/6379 || exit 1
+        printf "%b" "$1" >&3
+        sleep "$3"
+        printf "%b" "$2" >&3
+        out=""
+        while IFS= read -r -t 1 line <&3; do out="$out$line
+"; done
+        printf "%s" "$out"
+    ' _ "$1" "$2" "$3" 2>/dev/null | tr -d '\r'
+}
+
+raw_test_split() {
+    # $1=描述  $2=前半截  $3=后半截  $4=期望回复
+    local desc="$1" first="$2" second="$3" expect="$4"
+    local got
+    got=$(raw_send_split "$first" "$second" 0.4)
+    if [ "$got" = "$expect" ]; then
+        echo "  [PASS] $desc"; PASS=$((PASS+1))
+    else
+        echo "  [FAIL] $desc (got: '$got', want: '$expect')"; FAIL=$((FAIL+1))
+    fi
+}
+
+# 10. 半包：头部 *1 单独一个包，参数在第二个包（修复前直接 -ERR protocol error）
+raw_test_split "split: header then args" '*1\r\n' '$4\r\nPING\r\n' '+PONG'
+
+# 11. 半包：SET 命令拆在参数中间（头部+第1参数一包，其余参数一包）
+raw_test_split "split: SET mid-args" '*3\r\n$3\r\nSET\r\n' '$3\r\nspk\r\n$3\r\nspv\r\n' '+OK'
+
+# 12. 半包：bulk 内容 "spk" 被拆成 "s"+"pk"（内容跨包）
+raw_test_split "split: bulk content split" '*2\r\n$3\r\nGET\r\n$3\r\ns' 'pk\r\n' "$(printf '$3\nspv')"
+
+# 清理半包测试的键
+redis-cli -h $HOST -p $PORT DEL spk 2>/dev/null > /dev/null
+
+# 清理 inline 测试的键
+redis-cli -h $HOST -p $PORT DEL inline_k 2>/dev/null > /dev/null
 
 echo ""
 

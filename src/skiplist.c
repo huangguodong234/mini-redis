@@ -87,11 +87,15 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
     SkipNode *curr =sl->header;
 
     // 2. 从最高层往下查找，记录每层的前驱节点
-    for(int i=sl->max_level -1;i>=0;i--){          // 修复：i-- 而不是 i++
-        while(curr ->forward[i] && curr->forward[i]->score <score){
-            curr=curr->forward[i];
+    for(int i=sl->max_level-1;i>=0;i--){
+        // 前进条件：下一个节点存在，
+        //并且 (score更小) 或 (score相同但member字符串更小)
+        while(curr->forward[i] && (curr->forward[i]->score < score || 
+            (curr->forward[i]->score==score && 
+            strcmp(curr->forward[i]->member ,member)<0))){
+                curr=curr->forward[i];
         }
-        update[i]=curr;  // 该层的前驱指针
+        update[i]=curr; // 记录该层前驱
     }
    
     // 3. member 不存在（或被删除了），创建新节点
@@ -167,7 +171,7 @@ int skiplist_del(Skiplist *sl, const char *member) {
     } 
 
     // 3. 从各层链表中摘除该节点
-    for(int i=0;i<sl->max_level;i++){
+    for(int i=0;i<curr->level;i++){
         if(update[i]->forward[i]==curr){
             update[i]->forward[i]=curr->forward[i];
         }
@@ -229,10 +233,22 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
     }
 
     // 收集 count 个元素
+    int collected=0;
     for(int i=0 ;i<count && curr;i++){
         result[i]=strdup(curr->member);
+        if(!result[i]){
+            // B8 修复：strdup 失败不能把 NULL/未初始化值留在结果数组里
+            // （上层 while(member[count]) 会读到垃圾指针崩溃）。
+            // 释放已收集的部分，返回 NULL，让 commands.c 走 OOM 断开路径
+            for(int j=0;j<i;j++) free(result[j]);
+            free(result);
+            return NULL;
+        }
+        collected++;
         curr=curr->forward[0];
     }
+    // 防御：若节点数不足 count，把剩余位置置 NULL，避免上层读到未初始化内存
+    for(int i=collected;i<count;i++) result[i]=NULL;
     result[count]=NULL;
     return result;
 }

@@ -1,5 +1,5 @@
 # ============================================================
-# Makefile for mini-redis (阶段 2: 哈希表版)
+# Makefile for mini-redis (TCP 粘包修复阶段)
 # 用法：
 #   make        → 编译生成 server
 #   make clean  → 删除所有 .o 文件和 server
@@ -8,17 +8,17 @@
 # 1. 定义变量：以后换编译器或加参数只需改这里
 CC      = gcc                    # 编译器
 CFLAGS  = -Wall -g -Iinclude     # 编译选项：-Wall 显示所有警告，-g 加调试信息，-Iinclude 指定头文件目录
-TARGET  = server                 # 最终生成的可执行文件名
+TARGET  = mini-redis                 # 最终生成的可执行文件名
 
-# 2. 源文件列表（手动指定，因为我们只有 4 个 .c）
-SRCS = src/server.c src/protocol.c src/storage.c src/hashtable.c src/skiplist.c src/zset.c
+# 2. 源文件列表
+SRCS = src/server.c src/protocol.c src/storage.c src/hashtable.c src/skiplist.c src/zset.c src/main.c src/commands.c src/anet.c 
 
 # 3. 将 .c 后缀替换为 .o，得到目标文件列表
 #    例如：src/server.c → src/server.o
 OBJS    = $(SRCS:.c=.o)
 
 # ------------------------------------------------------------
-# 默认目标：all 依赖于 $(TARGET)，所以 make 会先生成 server
+# 默认目标：all 依赖于 $(TARGET)，所以 make 会先生成 mini-redis
 all: $(TARGET)
 
 # 4. 链接规则：用所有 .o 文件生成最终可执行文件
@@ -38,7 +38,7 @@ test: all
 
 # 内存检查
 valgrind: $(TARGET)
-	valgrind --leak-check=full --show-leak-kinds=all ./server
+	valgrind --leak-check=full --show-leak-kinds=all ./mini-redis
 
 # 清理规则：删除编译产物
 clean:

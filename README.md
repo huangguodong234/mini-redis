@@ -13,7 +13,7 @@
 make clean && make
 
 ### 运行服务器
-./server
+./mini-redis
 
 ### 用 redis-cli 连接测试
 redis-cli -h 127.0.0.1 -p 6379
@@ -106,7 +106,6 @@ OK
 | GET | 2427 | 字符串查询 |
 | SADD | 2384 | 集合添加（类比 ZADD） |
 | LRANGE_100 | 2010 | 范围查询（类比 ZRANGE） |
-| MSET (10 keys) | 1441 | 批量存储 |
 
 > 所有命令 QPS 稳定在 2300~2600 之间，LRANGE 因遍历底层链表稍低，符合预期。  
 > 服务器稳定运行，无崩溃、无内存泄漏。

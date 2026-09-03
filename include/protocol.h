@@ -8,11 +8,9 @@ typedef struct{
     char **argv;    //指向字符串数组（指向数组首元素的指针）的指针
 }Command;
 
-// 函数声明：把原始字符串解析成 Command
-// 参数 input 是客户端发来的原始字符串，比如 "*3\r\n..."
-Command *parse_command(const char *input);
-
-// 函数声明：释放 Command 占用的内存
-void free_command(Command*cmd);
+// 供第三层直接调用的辅助函数
+int parse_multibulk_header(const char *p, const char **next, int *argc);
+int parse_bulk_header(const char *p, const char **next, long *len);
+int extract_bulk_content(const char *p, long len, char **out, const char **next, const char *buf_end); // buf_end：缓冲区末尾（querybuf+qb_len），用于边界检查（B1 修复）
 
 #endif  //结束头文件保护

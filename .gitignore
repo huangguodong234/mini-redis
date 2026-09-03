@@ -1,6 +1,7 @@
 # 编译产物
 *.o
 server
+mini-redis
 test_skiplist
 test_zset
 test_hash
