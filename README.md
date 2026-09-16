@@ -15,6 +15,12 @@ make clean && make
 ### 运行服务器
 ./mini-redis
 
+> 自定义端口（按优先级：命令行参数 > `PORT` 环境变量 > 默认 6379）：
+> ```bash
+> ./mini-redis 6390          # 命令行参数指定端口
+> PORT=6390 ./mini-redis     # 环境变量指定端口
+> ```
+
 ### 用 redis-cli 连接测试
 redis-cli -h 127.0.0.1 -p 6379
 127.0.0.1:6379> SET name zhangsan
@@ -152,7 +158,7 @@ mini-redis/
 │ ├── test_resize.c # 哈希表扩容测试
 │ ├── test_skiplist.c # 跳表功能测试
 │ └── test_zset.c # 有序集合测试
-├── test.sh # 自动化回归测试脚本（23 用例）
+├── test.sh # 自动化回归测试脚本（35 用例，支持 HOST/PORT/SKIP_BUILD 覆盖）
 ├── Makefile
 └── README.md
 

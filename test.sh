@@ -1,231 +1,114 @@
-#!/bin/bash                 
-# 告诉系统：用 bash 执行这个脚本
-HOST="127.0.0.1"            # 服务器地址：本机
-PORT=6379                   # 端口：Redis 默认端口 6379
-PASS=0                      # 测试通过的数量，初始 0
-FAIL=0                      # 测试失败的数量，初始 0
+#!/usr/bin/env bash
+#
+# mini-redis 自动化回归测试
+#
+# 用法：
+#   ./test.sh                 # 用默认 127.0.0.1:6379 测试
+#   HOST=127.0.0.1 PORT=6390 ./test.sh   # 覆盖地址/端口
+#   SKIP_BUILD=1 ./test.sh    # 跳过重新编译（默认启动前先 make）
+#
+# 特性：
+#   * 启动服务器后用 PING 轮询等待就绪（不再用固定 sleep）
+#   * 失败时打印服务器日志尾部，便于定位
+#   * HOST/PORT 可用环境变量覆盖
+#   * 统一的断言辅助函数，用例直观
+#   * 退出码：全部通过返回 0，有失败返回 1
 
-echo "=== mini-redis 自动化测试 ==="  # 屏幕打印标题
-echo ""                               # 打印空行，更美观
+set -u                      # 未定义变量报错（set -e 不用，避免个别命令非零退出中断脚本）
 
-# 启动服务器
-./mini-redis > /tmp/server.log 2>&1 &
-# ./server            运行你写的 Redis 服务
-# > /tmp/server.log   把日志输出到文件，不占屏幕
-# 2>&1                把错误信息也一起输出到文件
-# &                   后台运行（不卡住脚本继续往下走）
+# ============ 配置（环境变量可覆盖） ============
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-6379}"
+LOG_FILE="/tmp/mini-redis-server-${PORT}.log"   # 每端口独立日志，避免并发脚本互相覆盖
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-5}"         # 等待服务器就绪的最长秒数
 
-SERVER_PID=$!           # 记住刚才启动的服务进程号（方便后面关掉）
-sleep 0.5               # 等待 0.5 秒，让服务完全启动
+# ============ 统计 ============
+PASS=0
+FAIL=0
 
-trap "kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null" EXIT
-# trap ... EXIT
-# 意思：脚本不管是正常结束、还是崩溃、还是按 Ctrl+C
-# 都会自动执行后面的命令：杀掉服务进程
-# 作用：**保证测试完一定关掉服务，不残留进程**
+# ============ 断言辅助 ============
+# 每个断言都回写统计，TOKEN 是输出颜色/前缀
+GREEN="\033[0;32m"; RED="\033[0;31m"; RESET="\033[0m"
 
-# ==================== PING 测试 ====================
-echo "--- 0. 连接测试 ---"
-R=$(redis-cli -h $HOST -p $PORT PING 2>/dev/null)
-if [ "$R" = "PONG" ]; then
-    echo "  [PASS] PING"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] PING (got: '$R')"; FAIL=$((FAIL+1))
-fi
-echo ""
+_record() {  # $1=通过与否  $2=描述  $3=额外信息(可选)
+    local ok="$1" desc="$2" extra="${3:-}"
+    if [ "$ok" = "1" ]; then
+        PASS=$((PASS+1))
+        printf "  ${GREEN}[PASS]${RESET} %s\n" "$desc"
+    else
+        FAIL=$((FAIL+1))
+        printf "  ${RED}[FAIL]${RESET} %s%s\n" "$desc" "$([ -n "$extra" ] && printf " (%s)" "$extra")"
+    fi
+}
 
-# ---------- 基本命令 ----------
-echo "--- 1. 基本命令 ---"  # 打印：第一组测试开始
+assert_eq() {  # $1=描述  $2=期望  $3=实际
+    if [ "$2" = "$3" ]; then
+        _record 1 "$1"
+    else
+        _record 0 "$1" "want='$2' got='$3'"
+    fi
+}
 
-# ==================== SET 测试 ====================
-R=$(redis-cli -h $HOST -p $PORT SET name zhangsan 2>/dev/null)
-# R=$(...)           把命令执行结果存到变量 R 里
-# redis-cli         官方 Redis 客户端工具
-# -h $HOST          连接本机
-# -p $PORT          连接 6379 端口
-# SET name zhangsan 发送存储命令
-# 2>/dev/null       屏蔽错误输出（只看结果）
+assert_contains() {  # $1=描述  $2=子串  $3=完整文本
+    if printf '%s' "$3" | grep -qF "$2"; then
+        _record 1 "$1"
+    else
+        _record 0 "$1" "missing '$2' in: '$3'"
+    fi
+}
 
-[ "$R" = "OK" ] && { echo "  [PASS] SET"; PASS=$((PASS+1)); } || { echo "  [FAIL] SET (got: '$R')"; FAIL=$((FAIL+1)); }
-# 这一行是简写的 判断 + 输出 + 计数
-# 如果 R 等于 "OK" → 打印 PASS,通过数+1
-# 否则 → 打印 FAIL,失败数+1
+assert_empty() {  # $1=描述  $2=待判值
+    if [ -z "$2" ]; then
+        _record 1 "$1"
+    else
+        _record 0 "$1" "want=<empty> got='$2'"
+    fi
+}
 
-# ==================== GET 测试 ====================
-R=$(redis-cli -h $HOST -p $PORT GET name 2>/dev/null)
-[ "$R" = "zhangsan" ] && { echo "  [PASS] GET"; PASS=$((PASS+1)); } || { echo "  [FAIL] GET (got: '$R')"; FAIL=$((FAIL+1)); }
-# 测试：获取刚才存的 name,期望得到 zhangsan
+# redis-cli 封装：去掉 stderr，结果赋值
+rcli() {
+    redis-cli -h "$HOST" -p "$PORT" "$@"
+}
 
-# ==================== GET 不存在的 key ====================
-R=$(redis-cli -h $HOST -p $PORT GET nokey 2>/dev/null)
-[ -z "$R" ] && { echo "  [PASS] GET miss"; PASS=$((PASS+1)); } || { echo "  [FAIL] GET miss (got: '$R')"; FAIL=$((FAIL+1)); }
-# [ -z "$R" ] 意思是:R 为空字符串
-# 期望：获取不存在的 key → 返回空
+# ============ 服务器生命周期 ============
+start_server() {
+    if [ "${SKIP_BUILD:-0}" != "1" ]; then
+        echo "==> 编译..."
+        if ! make >/dev/null 2>&1; then
+            echo "编译失败，中止。" >&2
+            exit 2
+        fi
+    fi
 
-# ==================== DEL 删除 ====================
-R=$(redis-cli -h $HOST -p $PORT DEL name 2>/dev/null)
-[ "$R" = "1" ] && { echo "  [PASS] DEL"; PASS=$((PASS+1)); } || { echo "  [FAIL] DEL (got: '$R')"; FAIL=$((FAIL+1)); }
-# 删除成功 → 返回 1
+    if [ ! -x ./mini-redis ]; then
+        echo "错误：找不到可执行文件 ./mini-redis（先 make）" >&2
+        exit 2
+    fi
 
-# ==================== DEL 再次删除 ====================
-R=$(redis-cli -h $HOST -p $PORT DEL name 2>/dev/null)
-[ "$R" = "0" ] && { echo "  [PASS] DEL again"; PASS=$((PASS+1)); } || { echo "  [FAIL] DEL again (got: '$R')"; FAIL=$((FAIL+1)); }
-# 删一个已经不存在的 key → 返回 0
+    echo "==> 启动服务器 ${HOST}:${PORT} ..."
+    ./mini-redis >"$LOG_FILE" 2>&1 &
+    SERVER_PID=$!
+    trap "kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null" EXIT
 
-echo ""  # 空行
+    # 用 PING 轮询等待就绪（而非固定 sleep），最多等 STARTUP_TIMEOUT 秒
+    local waited=0
+    while ! rcli PING >/dev/null 2>&1; do
+        sleep 0.1
+        waited=$((waited + 1))
+        if [ $waited -gt $((STARTUP_TIMEOUT * 10)) ]; then
+            echo "错误：服务器 ${waited}0ms 内未就绪，退出。日志如下：" >&2
+            tail -n 30 "$LOG_FILE" >&2
+            exit 2
+        fi
+    done
+    echo "==> 服务器已就绪（PID=$SERVER_PID）"
+}
 
-# ---------- 错误处理 ----------
-echo "--- 2. 错误处理 ---"
-
-# ==================== SET 参数错误 ====================
-R=$(redis-cli -h $HOST -p $PORT SET a 2>/dev/null)
-echo "$R" | grep -q "wrong number" && { echo "  [PASS] SET err"; PASS=$((PASS+1)); } || { echo "  [FAIL] SET err (got: '$R')"; FAIL=$((FAIL+1)); }
-# 故意少传参数：SET a
-# 期望返回错误包含 wrong number
-# grep -q "xxx"  检查字符串里是否包含 xxx
-
-# ==================== GET 参数错误 ====================
-R=$(redis-cli -h $HOST -p $PORT GET 2>/dev/null)
-echo "$R" | grep -q "wrong number" && { echo "  [PASS] GET err"; PASS=$((PASS+1)); } || { echo "  [FAIL] GET err (got: '$R')"; FAIL=$((FAIL+1)); }
-# 只写 GET，不写 key → 期望报错
-
-# ==================== 未知命令 ====================
-R=$(redis-cli -h $HOST -p $PORT UNKNOWN 2>/dev/null)
-echo "$R" | grep -qi "unknown" && { echo "  [PASS] UNKNOWN"; PASS=$((PASS+1)); } || { echo "  [FAIL] UNKNOWN (got: '$R')"; FAIL=$((FAIL+1)); }
-# 发送一个不存在的命令 UNKNOWN
-# 期望报错包含 unknown
-
-# ---------- 有序集合 ----------
-echo "--- 3. 有序集合  ---"
-
-# ==================== 添加ZADD 第一个元素 ====================
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset 10 apple 2>/dev/null)
-if [ "$R" = "OK" ] || [ "$R" = "1" ]; then
-    echo "  [PASS] ZADD apple"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZADD apple (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# ==================== 添加ZADD 第二个元素 ====================
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset 5 banana 2>/dev/null)
-if [ "$R" = "OK" ] || [ "$R" = "1" ]; then
-    echo "  [PASS] ZADD banana"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZADD banana (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# ============ ZADD 更新（同一 member 不同 score） ====================
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset 20 apple 2>/dev/null)
-if [ "$R" = "OK" ] || [ "$R" = "0" ]; then
-    echo "  [PASS] ZADD update apple"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZADD update apple (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# ==================== ZSCORE 测试 ====================
-R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset banana 2>/dev/null)
-if [ "$R" = "5" ]; then
-    echo "  [PASS] ZSCORE banana"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZSCORE banana (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset apple 2>/dev/null)
-if [ "$R" = "20" ]; then
-    echo "  [PASS] ZSCORE apple"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZSCORE apple (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset cherry 2>/dev/null)
-if [ -z "$R" ]; then
-    echo "  [PASS] ZSCORE miss"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZSCORE miss (got: '$R')"; FAIL=$((FAIL+1))
-fi
-     
-
-# ==================== ZRANGE 查询全部 ====================
-R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset 0 -1 2>/dev/null)
-if echo "$R" | grep -q "banana" && echo "$R" | grep -q "apple"; then
-    echo "  [PASS] ZRANGE all"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZRANGE all (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# ==================== ZRANGE 索引范围 ====================
-R=$(redis-cli --raw -h $HOST -p $PORT ZRANGE myzset 0 0 2>/dev/null)
-if [ "$R" = "banana" ]; then
-    echo "  [PASS] ZRANGE 0 0"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZRANGE 0 0 (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-
-
-# ==================== ZREM 删除 ====================
-R=$(redis-cli -h $HOST -p $PORT ZREM myzset banana 2>/dev/null)
-if [ "$R" = "1" ]; then
-    echo "  [PASS] ZREM banana"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZREM banana (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# ==================== ZREM 删除不存在的 ====================
-R=$(redis-cli -h $HOST -p $PORT ZREM myzset banana 2>/dev/null)
-if [ "$R" = "0" ]; then
-    echo "  [PASS] ZREM banana again"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZREM banana again (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# ==================== 边界测试 ====================
-echo "--- 4 . 边界测试 ---"
-# 1. ZADD 相同 member 相同 score
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset 20 apple 2>/dev/null)
-if [ "$R" = "OK" ] || [ "$R" = "0" ]; then
-    echo " [PASS] ZADD same member same score";PASS=$((PASS+1))
-else
-    echo " [FAIL] ZADD same member same score(got: '$R')";FAIL=$((FAIL+1))
-fi
-
-# 确认 score 没变
-R=$(redis-cli -h $HOST -p $PORT ZSCORE myzset apple 2>/dev/null)
-if [ "$R" = "20" ]; then
-    echo " [PASS] ZSCORE apple still 20";PASS=$((PASS+1))
-else    
-    echo " [FAIL] ZSCORE apple still 20(got: '$R')";FAIL=$((FAIL+1))
-fi    
-
-# 2. ZRANGE 负数索引（先添加两个元素）
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset 30 cherry 2>/dev/null)
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset 40 date 2>/dev/null)
-R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset -2 -1 2>/dev/null)
-if echo "$R" | grep -q "cherry" && echo "$R" | grep -q "date"; then
-    echo " [PASS] ZRANGE -2 -1";PASS=$((PASS+1))
-else
-    echo " [FAIL] ZRANGE -2 -1";FAIL=$((FAIL+1))
-fi        
-
-# 3. ZRANGE 超出范围索引（应返回空）
-R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset 10 20 2>/dev/null)
-# 空输出或 (empty array) 都算通过，简单判断不包含已知元素
-if ! echo "$R" | grep -q "apple"; then
-    echo "  [PASS] ZRANGE out of range (empty)"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZRANGE out of range (got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-echo ""
-
-# ==================== B3/B9 回归 + inline 命令测试 ====================
-echo "--- 6. B3 参数上限 / B9 参数校验 / inline 命令 ---"
-
-# raw_send: 开一条裸 TCP 连接（/dev/tcp，不依赖 nc），原样发送 $1（可用 \r\n 转义），
-# 读回 1 秒内到达的所有响应行并去掉 \r
+# ============ 裸 TCP 辅助（/dev/tcp，不依赖 nc） ============
+# raw_send: 开一条裸 TCP 连接，原样发送 $1（可用 \r\n 转义），读回 1 秒内所有响应行并去掉 \r
 raw_send() {
     timeout 3 bash -c '
-        exec 3<>/dev/tcp/127.0.0.1/6379 || exit 1
+        exec 3<>/dev/tcp/'"$HOST"'/'"$PORT"' || exit 1
         printf "%b" "$1" >&3
         out=""
         while IFS= read -r -t 1 line <&3; do out="$out$line
@@ -234,71 +117,17 @@ raw_send() {
     ' _ "$1" 2>/dev/null | tr -d '\r'
 }
 
+# raw_test: $1=描述  $2=发送数据  $3=期望回复（已去 \r，可多行）
 raw_test() {
-    # $1=描述  $2=发送的原始数据  $3=期望回复（已去掉 \r，可能多行）
-    local desc="$1" payload="$2" expect="$3"
-    local got
+    local desc="$1" payload="$2" expect="$3" got
     got=$(raw_send "$payload")
-    if [ "$got" = "$expect" ]; then
-        echo "  [PASS] $desc"; PASS=$((PASS+1))
-    else
-        echo "  [FAIL] $desc (got: '$got', want: '$expect')"; FAIL=$((FAIL+1))
-    fi
+    assert_eq "$desc" "$expect" "$got"
 }
 
-# 1. B3 回归：12 参数命令（修复前直接 protocol error；上限已提至 1024）
-R=$(redis-cli -h $HOST -p $PORT PING a b c d e f g h i j k l 2>/dev/null)
-if [ "$R" = "PONG" ]; then
-    echo "  [PASS] 12-arg PING accepted (B3)"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] 12-arg PING (B3, got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# 2. B3 回归：*2000 头（超过 1024 上限，应报协议错误并断开）
-raw_test "*2000 header rejected" '*2000\r\n' '-ERR protocol error'
-
-# 3. B9 回归：ZADD 垃圾 score（修复前 atof("abc") 静默按 0 处理）
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset abc m1 2>&1)
-if echo "$R" | grep -q "value is not a valid float"; then
-    echo "  [PASS] ZADD invalid score rejected (B9)"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZADD invalid score (B9, got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# 4. B9 回归：ZADD NaN score（修复前 NaN 会永久破坏跳表排序）
-R=$(redis-cli -h $HOST -p $PORT ZADD myzset nan m2 2>&1)
-if echo "$R" | grep -q "value is not a valid float"; then
-    echo "  [PASS] ZADD NaN score rejected (B9)"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZADD NaN score (B9, got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# 5. B9 回归：ZRANGE 垃圾索引（修复前 atoi 不报错）
-R=$(redis-cli -h $HOST -p $PORT ZRANGE myzset a 1 2>&1)
-if echo "$R" | grep -q "value is not an integer or out of range"; then
-    echo "  [PASS] ZRANGE invalid index rejected (B9)"; PASS=$((PASS+1))
-else
-    echo "  [FAIL] ZRANGE invalid index (B9, got: '$R')"; FAIL=$((FAIL+1))
-fi
-
-# 6. inline 命令：经典用法 echo "PING" | nc（不走 RESP 数组协议）
-raw_test "inline PING" 'PING\r\n' '+PONG'
-
-# 7. inline SET
-raw_test "inline SET" 'SET inline_k inline_v\r\n' '+OK'
-
-# 8. inline GET（RESP 响应两行：长度行 + 内容行；inline_v 长 8）
-raw_test "inline GET" 'GET inline_k\r\n' "$(printf '$8\ninline_v')"
-
-# 9. inline 空行：应被跳过而不是协议错误
-raw_test "inline blank line ignored" '\r\nPING\r\n' '+PONG'
-
-# ---------- 半包（split packet）回归 ----------
-# raw_send_split: 先发 $1（前半截），等 $3 秒，再发 $2（后半截）。
-# 模拟 TCP 把一条完整命令拆成两个包到达的场景（半包处理的回归测试）。
+# raw_send_split: 先发 $1，等 $3 秒，再发 $2——模拟半包（一条命令拆成两个 TCP 包到达）
 raw_send_split() {
     timeout 5 bash -c '
-        exec 3<>/dev/tcp/127.0.0.1/6379 || exit 1
+        exec 3<>/dev/tcp/'"$HOST"'/'"$PORT"' || exit 1
         printf "%b" "$1" >&3
         sleep "$3"
         printf "%b" "$2" >&3
@@ -309,47 +138,140 @@ raw_send_split() {
     ' _ "$1" "$2" "$3" 2>/dev/null | tr -d '\r'
 }
 
+# raw_test_split: $1=描述  $2=前半截  $3=后半截  $4=期望回复
 raw_test_split() {
-    # $1=描述  $2=前半截  $3=后半截  $4=期望回复
     local desc="$1" first="$2" second="$3" expect="$4"
-    local got
-    got=$(raw_send_split "$first" "$second" 0.4)
-    if [ "$got" = "$expect" ]; then
-        echo "  [PASS] $desc"; PASS=$((PASS+1))
-    else
-        echo "  [FAIL] $desc (got: '$got', want: '$expect')"; FAIL=$((FAIL+1))
-    fi
+    assert_eq "$desc" "$expect" "$(raw_send_split "$first" "$second" 0.4)"
 }
 
-# 10. 半包：头部 *1 单独一个包，参数在第二个包（修复前直接 -ERR protocol error）
-raw_test_split "split: header then args" '*1\r\n' '$4\r\nPING\r\n' '+PONG'
+# ============ 测试开始 ============
+echo "=== mini-redis 自动化测试 (${HOST}:${PORT}) ==="
+echo ""
+start_server
 
-# 11. 半包：SET 命令拆在参数中间（头部+第1参数一包，其余参数一包）
-raw_test_split "split: SET mid-args" '*3\r\n$3\r\nSET\r\n' '$3\r\nspk\r\n$3\r\nspv\r\n' '+OK'
-
-# 12. 半包：bulk 内容 "spk" 被拆成 "s"+"pk"（内容跨包）
-raw_test_split "split: bulk content split" '*2\r\n$3\r\nGET\r\n$3\r\ns' 'pk\r\n' "$(printf '$3\nspv')"
-
-# 清理半包测试的键
-redis-cli -h $HOST -p $PORT DEL spk 2>/dev/null > /dev/null
-
-# 清理 inline 测试的键
-redis-cli -h $HOST -p $PORT DEL inline_k 2>/dev/null > /dev/null
-
+# ---------- 0. 连接测试 ----------
+echo "--- 0. 连接测试 ---"
+assert_eq "PING" "PONG" "$(rcli PING 2>/dev/null)"
 echo ""
 
-# ==================== 最终结果统计 ====================
-# 确保 cherry date 不存在（防止之前测试残留）
-redis-cli -h $HOST -p $PORT ZREM myzset cherry 2>/dev/null > /dev/null
-redis-cli -h $HOST -p $PORT ZREM myzset date 2>/dev/null > /dev/null
+# ---------- 1. 基本命令 ----------
+echo "--- 1. 基本命令 ---"
+assert_eq "SET" "OK" "$(rcli SET name zhangsan 2>/dev/null)"
+assert_eq "GET" "zhangsan" "$(rcli GET name 2>/dev/null)"
+assert_empty "GET miss" "$(rcli GET nokey 2>/dev/null)"
+assert_eq "DEL" "1" "$(rcli DEL name 2>/dev/null)"
+assert_eq "DEL again" "0" "$(rcli DEL name 2>/dev/null)"
+echo ""
 
-TOTAL=$((PASS+FAIL))            # 总用例数 = 通过 + 失败
-echo "=== 结果: $PASS/$TOTAL 通过 ==="  # 打印成绩
+# ---------- 2. 错误处理 ----------
+echo "--- 2. 错误处理 ---"
+assert_contains "SET err (wrong number)" "wrong number" "$(rcli SET a 2>&1)"
+assert_contains "GET err (wrong number)" "wrong number" "$(rcli GET 2>&1)"
+assert_contains "UNKNOWN command" "unknown" "$(rcli UNKNOWN 2>&1)"
+echo ""
 
-if [ $FAIL -eq 0 ]; then        # 如果失败数为 0
+# ---------- 3. 有序集合 ----------
+echo "--- 3. 有序集合 ---"
+R=$(rcli ZADD myzset 10 apple 2>/dev/null)
+[ "$R" = "OK" ] || [ "$R" = "1" ] && _record 1 "ZADD apple" || _record 0 "ZADD apple" "want=OK/1 got='$R'"
+
+R=$(rcli ZADD myzset 5 banana 2>/dev/null)
+[ "$R" = "OK" ] || [ "$R" = "1" ] && _record 1 "ZADD banana" || _record 0 "ZADD banana" "want=OK/1 got='$R'"
+
+R=$(rcli ZADD myzset 20 apple 2>/dev/null)
+[ "$R" = "OK" ] || [ "$R" = "0" ] && _record 1 "ZADD update apple" || _record 0 "ZADD update apple" "want=OK/0 got='$R'"
+
+assert_eq "ZSCORE banana" "5" "$(rcli ZSCORE myzset banana 2>/dev/null)"
+assert_eq "ZSCORE apple" "20" "$(rcli ZSCORE myzset apple 2>/dev/null)"
+assert_empty "ZSCORE miss" "$(rcli ZSCORE myzset cherry 2>/dev/null)"
+
+R=$(rcli ZRANGE myzset 0 -1 2>/dev/null)
+{ printf '%s' "$R" | grep -q "banana" && printf '%s' "$R" | grep -q "apple"; } \
+    && _record 1 "ZRANGE all" || _record 0 "ZRANGE all" "got='$R'"
+
+assert_eq "ZRANGE 0 0" "banana" "$(rcli --raw ZRANGE myzset 0 0 2>/dev/null)"
+
+assert_eq "ZREM banana" "1" "$(rcli ZREM myzset banana 2>/dev/null)"
+assert_eq "ZREM banana again" "0" "$(rcli ZREM myzset banana 2>/dev/null)"
+echo ""
+
+# ---------- 4. 边界测试 ----------
+echo "--- 4. 边界测试 ---"
+R=$(rcli ZADD myzset 20 apple 2>/dev/null)
+[ "$R" = "OK" ] || [ "$R" = "0" ] && _record 1 "ZADD same member same score" || _record 0 "ZADD same member same score" "got='$R'"
+assert_eq "ZSCORE apple still 20" "20" "$(rcli ZSCORE myzset apple 2>/dev/null)"
+
+rcli ZADD myzset 30 cherry  >/dev/null 2>&1
+rcli ZADD myzset 40 date   >/dev/null 2>&1
+R=$(rcli ZRANGE myzset -2 -1 2>/dev/null)
+{ printf '%s' "$R" | grep -q "cherry" && printf '%s' "$R" | grep -q "date"; } \
+    && _record 1 "ZRANGE -2 -1" || _record 0 "ZRANGE -2 -1" "got='$R'"
+
+R=$(rcli ZRANGE myzset 10 20 2>/dev/null)
+if ! printf '%s' "$R" | grep -q "apple"; then
+    _record 1 "ZRANGE out of range (empty)"
+else
+    _record 0 "ZRANGE out of range (empty)" "got='$R'"
+fi
+echo ""
+
+# ---------- 5. B3/B9 回归 + inline 命令 ----------
+echo "--- 5. B3 参数上限 / B9 参数校验 / inline 命令 ---"
+# 1. B3：12 参数命令（修复前直接 protocol error；上限已提至 1024）
+assert_eq "12-arg PING (B3)" "PONG" "$(rcli PING a b c d e f g h i j k l 2>/dev/null)"
+
+# 2. B3：*2000 头（超 1024 上限，应报协议错误并断开）
+raw_test "*2000 header rejected" '*2000\r\n' '-ERR protocol error'
+
+# 3. B9：ZADD 垃圾 score（修复前 atof("abc") 按 0 处理）
+assert_contains "ZADD invalid score (B9)" "value is not a valid float" "$(rcli ZADD myzset abc m1 2>&1)"
+
+# 4. B9：ZADD NaN score（修复前 NaN 破坏跳表排序）
+assert_contains "ZADD NaN score (B9)" "value is not a valid float" "$(rcli ZADD myzset nan m2 2>&1)"
+
+# 5. B9：ZRANGE 垃圾索引（修复前 atoi 不报错）
+assert_contains "ZRANGE invalid index (B9)" "value is not an integer or out of range" "$(rcli ZRANGE myzset a 1 2>&1)"
+
+# 6. inline 命令：经典 echo "PING" | nc（不走 RESP 数组协议）
+raw_test "inline PING" 'PING\r\n' '+PONG'
+
+# 7. inline SET
+raw_test "inline SET" 'SET inline_k inline_v\r\n' '+OK'
+
+# 8. inline GET（RESP 两行：长度行 + 内容行；inline_v 长 8）
+raw_test "inline GET" 'GET inline_k\r\n' "$(printf '$8\ninline_v')"
+
+# 9. inline 空行：应被跳过而不是协议错误
+raw_test "inline blank line ignored" '\r\nPING\r\n' '+PONG'
+
+# ---------- 半包（split packet）回归 ----------
+# 10. 头部 *1 单独一个包，参数在第二个包
+raw_test_split "split: header then args" '*1\r\n' '$4\r\nPING\r\n' '+PONG'
+
+# 11. SET 命令拆在参数中间
+raw_test_split "split: SET mid-args" '*3\r\n$3\r\nSET\r\n' '$3\r\nspk\r\n$3\r\nspv\r\n' '+OK'
+
+# 12. bulk 内容 "spk" 被拆成 "s"+"pk"（内容跨包）
+raw_test_split "split: bulk content split" '*2\r\n$3\r\nGET\r\n$3\r\ns' 'pk\r\n' "$(printf '$3\nspv')"
+
+# 清理半包 / inline 测试的键
+rcli DEL spk      >/dev/null 2>&1
+rcli DEL inline_k >/dev/null 2>&1
+echo ""
+
+# ---------- 最终结果统计 ----------
+# 清理可能残留的边界测试键，避免下次运行受影响
+rcli ZREM myzset cherry >/dev/null 2>&1
+rcli ZREM myzset date   >/dev/null 2>&1
+
+TOTAL=$((PASS+FAIL))
+echo "=== 结果: $PASS/$TOTAL 通过 ==="
+if [ "$FAIL" -eq 0 ]; then
     echo "全部通过! ✅"
-    exit 0                      # 脚本返回成功
+    exit 0
 else
     echo "存在失败 ❌"
-    exit 1                      # 脚本返回失败
+    echo ">>> 服务器日志末尾（$LOG_FILE）："
+    tail -n 20 "$LOG_FILE"
+    exit 1
 fi

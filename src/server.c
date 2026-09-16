@@ -91,9 +91,20 @@ void free_client(Client *c) {
 }
 
 // 发送响应给客户端（我们直接发送 RESP 格式字符串）
+// 循环 write，处理部分写入和 EINTR（信号打断），保证整条响应发完，RESP 协议不截断
 void send_response(int client_fd,const char*resp){
     if(!resp) return;
-    write(client_fd,resp,strlen(resp));
+    size_t len = strlen(resp);
+    const char *p = resp;
+    while (len > 0) {
+        ssize_t n = write(client_fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;      // 被信号打断，重试
+            break;                             // 其余写错误（如对端关闭），放弃本次
+        }
+        p += n;
+        len -= (size_t)n;
+    }
 }
 
 /*
@@ -161,7 +172,7 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
         return;
     }
 
-    int nread;
+    int nread = 0;   // 初始化：若首轮循环因缓冲区满（avail==0）直接跳出，nread 也不可未定义
     // 2. 循环读取数据
     while(1){
         // 计算剩余空间（预留1字节给'\0'）

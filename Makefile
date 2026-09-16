@@ -7,7 +7,7 @@
 
 # 1. 定义变量：以后换编译器或加参数只需改这里
 CC      = gcc                    # 编译器
-CFLAGS  = -Wall -g -Iinclude     # 编译选项：-Wall 显示所有警告，-g 加调试信息，-Iinclude 指定头文件目录
+CFLAGS  = -Wall -O2 -g -Iinclude     # 编译选项：-Wall 显示所有警告，-g 加调试信息，-Iinclude 指定头文件目录
 TARGET  = mini-redis                 # 最终生成的可执行文件名
 
 # 2. 源文件列表

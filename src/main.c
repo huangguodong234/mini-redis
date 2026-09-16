@@ -10,12 +10,13 @@
 #include <netinet/in.h> // sockaddr_in 结构体{sin_family：地址家族，IPv4 填 AF_INET   sin_port：端口号，必须用 htons() 转成网络字节序 sin_addr.s_addr：IP 地址，INADDR_ANY 表示监听本机所有网络接口}
 #include <arpa/inet.h>  // htons（）, inet_ntoa()-表示把二进制IP地址转化为人类可以看的懂的语言
 #include <errno.h>        //errno()：全局变量，当系统调用错误时，记录错误的类型
+#include <stdlib.h>       // atoi()：字符串转整数（读取自定义端口）
 
 #include "server.h"
 #include "storage.h"
 #include "zset.h"  
 
-#define PORT 6379         //定死服务器监听的端口号
+#define DEFAULT_PORT 6379 //默认监听端口（可用命令行参数或 PORT 环境变量覆盖）
 #define BACKLOG 10        //等待连接队列的最大长度（B6 修复：统一定义在此处，server.c 不再重复定义）
 
 
@@ -40,8 +41,20 @@ void setup_signal_handler(void){
     sigaction(SIGINT,&sa,NULL);      //将SIGINT（Ctrl+c触发终止进程）绑定到sa中
 }
 
-int main(){
+int main(int argc, char **argv){
     srand((unsigned)time(NULL));  // 用当前时间播种随机数，使跳表结构不再每次启动相同
+
+    // 解析监听端口：命令行参数 > 环境变量 PORT > 默认 6379
+    int port = DEFAULT_PORT;
+    const char *env_port = getenv("PORT");
+    if (env_port && *env_port) {
+        int ep = atoi(env_port);          // 环境变量优先于默认值
+        if (ep > 0 && ep <= 65535) port = ep;
+    }
+    if (argc >= 2) {
+        int ap = atoi(argv[1]);           // 命令行参数优先级最高
+        if (ap > 0 && ap <= 65535) port = ap;
+    }
 
     // 初始化存储引擎
     Storage *store = storage_init();
@@ -51,7 +64,7 @@ int main(){
     setup_signal_handler();
 
     /*创建服务器 socket（已绑定并监听）*/
-    int server_fd = create_server_socket(PORT, BACKLOG);
+    int server_fd = create_server_socket(port, BACKLOG);
 
     //主循环，不断接受新客户端,受 keep_running 控制 ----
     while(Keep_running){
