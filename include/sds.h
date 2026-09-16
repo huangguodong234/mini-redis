@@ -2,6 +2,7 @@
 #define SDS_H
 
 #include <stddef.h>   // size_t
+#include <stdint.h>   // uint8_t/uint16_t/uint32_t/uint64_t
 
 /* ============================================================
  * SDS —— Simple Dynamic String（简单动态字符串）
@@ -94,8 +95,10 @@
  *    下次再拼接，直接复用这块空间，避免"用完就缩、缩完又扩"
  *    的反复 malloc/free。
 
- * 注意：本实现是"教学精简版"，扩容只实现了简洁的翻倍策略，
- * 没有做 1MB 阈值分档；但均摊 O(1) 的思想是通的。
+ * 注意：本实现已完整实现 1MB 阈值分档（<1MB 翻倍、≥1MB 仅 +1MB），
+ * 与真正的 Redis 策略一致；均摊 O(1) 追加。
+ * 另外，前面讲到的"分规格头部"（TYPE_5/8/16/32/64）也已实现，
+ * 短字符串自动用小的头部，省内存。
  * ------------------------------------------------------------ */
 
 /* ------------------------------------------------------------
@@ -114,15 +117,126 @@
  * 具体数据类型定义
  * ============================================================ */
 
-/* 动态字符串头部（元数据）。sds 指针指向的内存，前面紧挨着它。 */
-typedef struct sdshdr {
-    size_t len;     /* 已使用的字节数（不含结尾 '\0'）——O(1) 取长度靠它 */
-    size_t alloc;   /* 已分配的可用空间（不含结尾 '\0'，但实际多留了1字节给 '\0'） */
-} sdshdr;
+/* ------------------------------------------------------------
+ * 二点五、分规格头部（TYPE_5 / 8 / 16 / 32 / 64）
+ * ------------------------------------------------------------
+ * 字符串长度差别很大（"OK" vs 几 GB 的缓存），如果所有字符串都
+ * 用一个固定大小的头部，短字符串会白白浪费内存（比如：只存 3 字节
+ * 的 "abc"，若头部固定 16 字节，则共 17 字节，浪费 5 倍多）。
+ *
+ * 所以 Redis 按"数据长度"分 5 档，每档用尽量小的整型存 len/alloc：
+ *
+ *   类型      位宽(len/alloc)     头部总大小      适配的数据长度
+ *   SDS_TYPE_5    —— (见下)          1B            ≤ 31 字节
+ *   SDS_TYPE_8    uint8 / uint8      3B            < 256 字节
+ *   SDS_TYPE_16   uint16/uint16      5B            < 64KB
+ *   SDS_TYPE_32   uint32/uint32      9B            < 4GB
+ *   SDS_TYPE_64   uint64/uint64     17B            大字符串
+ *
+ * 每个头部都以 1 个字节的 flags 开头：
+ *   低 3 位 = 类型编号（SDS_TYPE_*）
+ *   高 5 位 = 附加标志位（本实现未使用，保留）
+ * 而 TYPE_5 是特例：它没有独立的 len/alloc 字段，len 就存在
+ * flags 的高 5 位里（上限 31），size=1 即 flags 自己；所以
+ * TYPE_5 的字符串"分配后"长度不可变（alloc==len，没法再增长），
+ * 遇到需要增长时会先迁移到高一档 TYPE_8。
+ *
+ * 这样 "abc"(len=3) 只用 1B type + '\0' = 2B，比定长 17B 省很多。
+ * ------------------------------------------------------------ */
 
-/* sds 类型：就是一个 char*，指向"数据区"（header 在它前面）。
- * 所以"header 起始 = sds 指针 - sizeof(sdshdr)"。 */
+#define SDS_TYPE_5  0   /* 极短：len 存于 flags 高 5 位，上限 31，alloc==len */
+#define SDS_TYPE_8  1   /* uint8  len/alloc */
+#define SDS_TYPE_16 2   /* uint16 len/alloc */
+#define SDS_TYPE_32 3   /* uint32 len/alloc */
+#define SDS_TYPE_64 4   /* uint64 len/alloc */
+
+/* flags 里"类型"占低 3 位，类型编号用这个掩码取出 */
+#define SDS_TYPE_MASK 7
+#define SDS_TYPE_BITS 3
+
+/* TYPE_5 里 len 存于高 5 位，这是高 5 位能表示的最大值 */
+#define SDS_TYPE_5_LEN 31
+
+/* 五种头部结构。每个都以 1 字节 flags 开头（对齐真实 Redis 布局）。 */
+
+/* TYPE_5：无独立 len/alloc 字段，len 存在 flags 高 5 位 */
+struct __attribute__((__packed__)) sdshdr5 {
+    unsigned char flags; /* 低3位=type，高5位=len */
+};
+
+/* TYPE_8 ~ TYPE_64：flags + len + alloc，位宽逐级增大。
+ * 必须 packed：去掉尾部对齐填充，保证 sizeof 恰好等于字段字节数，
+ * 否则 "flags 在 data[-1]" 和 "data = base + sizeof(hdr)" 的换算会错位。 */
+struct __attribute__((__packed__)) sdshdr8 {
+    uint8_t len;    /* used */
+    uint8_t alloc;  /* 不含结尾 '\0' */
+    unsigned char flags; /* 低3位=type，高5位=标志 */
+};
+struct __attribute__((__packed__)) sdshdr16 {
+    uint16_t len;
+    uint16_t alloc;
+    unsigned char flags;
+};
+struct __attribute__((__packed__)) sdshdr32 {
+    uint32_t len;
+    uint32_t alloc;
+    unsigned char flags;
+};
+struct __attribute__((__packed__)) sdshdr64 {
+    uint64_t len;
+    uint64_t alloc;
+    unsigned char flags;
+};
+
+/* sds 类型：就是一个 char*，指向"数据区"（各类头部都在它前面）。
+ * 调用者拿到的永远是数据区起始地址，看起来就是一个普通字符串。 */
 typedef char *sds;
+
+/* 根据字符串长度选一个最省的头部类型（对齐 Redis sdsReqType） */
+static inline char sdsReqType(size_t string_size) {
+    if (string_size < 1 << 5)                       return SDS_TYPE_5;
+    if (string_size < 1 << 8)                       return SDS_TYPE_8;
+    if (string_size < 1 << 16)                      return SDS_TYPE_16;
+    if (string_size < 1ll << 32)                    return SDS_TYPE_32;
+    return SDS_TYPE_64;
+}
+
+/* 某类型头部总大小（含 flags）。TYPE_5 只有 1 字节。 */
+static inline size_t sdsHdrSize(char type) {
+    switch (type & SDS_TYPE_MASK) {
+        case SDS_TYPE_5:  return sizeof(struct sdshdr5);
+        case SDS_TYPE_8:  return sizeof(struct sdshdr8);
+        case SDS_TYPE_16: return sizeof(struct sdshdr16);
+        case SDS_TYPE_32: return sizeof(struct sdshdr32);
+        case SDS_TYPE_64: return sizeof(struct sdshdr64);
+    }
+    return 0; /* 不可达 */
+}
+
+/* 某类型里 len 字段的位宽（TYPE_5 特殊：无独立 len，返回 0） */
+static inline size_t sdsTypeLenSize(char type) {
+    switch (type & SDS_TYPE_MASK) {
+        case SDS_TYPE_5:  return 0;   /* len 藏在 flags 里 */
+        case SDS_TYPE_8:  return 1;
+        case SDS_TYPE_16: return 2;
+        case SDS_TYPE_32: return 4;
+        case SDS_TYPE_64: return 8;
+    }
+    return 0;
+}
+
+/* 从 sds 数据指针反推头部起始地址。
+ * flags 总是紧挨在数据前面 1 字节，所以先读 flags 判断类型，
+ * 再按该类型头部大小往前回溯。 */
+static inline char sds_type(const sds s) {
+    return s[-1] & SDS_TYPE_MASK;
+}
+
+/* 取某类型头部的指针（按类型回溯到对应 struct） */
+static inline struct sdshdr8  *sds_hdr8 (const sds s) { return (struct sdshdr8  *)(void *)(s - sizeof(struct sdshdr8)); }
+static inline struct sdshdr16 *sds_hdr16(const sds s) { return (struct sdshdr16 *)(void *)(s - sizeof(struct sdshdr16)); }
+static inline struct sdshdr32 *sds_hdr32(const sds s) { return (struct sdshdr32 *)(void *)(s - sizeof(struct sdshdr32)); }
+static inline struct sdshdr64 *sds_hdr64(const sds s) { return (struct sdshdr64 *)(void *)(s - sizeof(struct sdshdr64)); }
 
 /* ============================================================
  * 六、用前必读：sds 的 4 个坑 / 使用约定
