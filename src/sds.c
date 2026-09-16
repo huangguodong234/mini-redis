@@ -35,11 +35,13 @@ static inline size_t sdsalloc_type(const sds s, char type) {
 
 sds sdsnewlen(const void *init, size_t initlen) {
     char type = sdsReqType(initlen);
-    size_t hdrlen = sdsHdrSize(type);
+    /* 防御：TYPE_5 的高 5 位最多表示 31（SDS_TYPE_5_LEN）。
+     * 当前 sdsReqType 用 `len < 1<<5` 判断，触不到此分支，
+     * 但保留可在边界判据变动时避免写到 5 位放不下的长度。 */
     if (type == SDS_TYPE_5 && initlen > SDS_TYPE_5_LEN) {
         type = SDS_TYPE_8;
     }
-    hdrlen = sdsHdrSize(type);
+    size_t hdrlen = sdsHdrSize(type);
     sds s = malloc(hdrlen + initlen + 1);
     if (s == NULL) return NULL;
     if (type == SDS_TYPE_5) {
