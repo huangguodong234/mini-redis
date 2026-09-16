@@ -146,7 +146,8 @@ mini-redis/
 │ ├── storage.h # 存储层接口
 │ ├── hashtable.h # 哈希表接口
 │ ├── skiplist.h # 跳表接口
-│ └── zset.h # 有序集合接口
+│ ├── zset.h # 有序集合接口
+│ └── sds.h # 简单动态字符串接口（SDS，预留缓冲动态化）
 ├── src/
 │ ├── server.c # 服务器主程序（Socket + 事件循环）
 │ ├── protocol.c # RESP 协议解析器
@@ -154,6 +155,7 @@ mini-redis/
 │ ├── hashtable.c # 哈希表实现（djb2 + 链地址法）
 │ ├── skiplist.c # 跳表实现
 │ ├── zset.c # 有序集合（封装跳表）
+│ ├── sds.c # 简单动态字符串实现（自动扩容/二进制安全）
 │ ├── bench_client.c # 原生 C 压测客户端
 │ ├── test_resize.c # 哈希表扩容测试
 │ ├── test_skiplist.c # 跳表功能测试

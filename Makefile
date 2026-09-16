@@ -11,7 +11,7 @@ CFLAGS  = -Wall -O2 -g -Iinclude     # 编译选项：-Wall 显示所有警告�
 TARGET  = mini-redis                 # 最终生成的可执行文件名
 
 # 2. 源文件列表
-SRCS = src/server.c src/protocol.c src/storage.c src/hashtable.c src/skiplist.c src/zset.c src/main.c src/commands.c src/anet.c 
+SRCS = src/server.c src/protocol.c src/storage.c src/hashtable.c src/skiplist.c src/zset.c src/main.c src/commands.c src/anet.c src/sds.c 
 
 # 3. 将 .c 后缀替换为 .o，得到目标文件列表
 #    例如：src/server.c → src/server.o
