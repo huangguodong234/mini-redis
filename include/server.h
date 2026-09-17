@@ -31,17 +31,14 @@ Client *create_client(int fd);
 // 释放客户端（关闭连接并释放内存）
 void free_client(Client *c);
 
-// 发送响应给客户端（按明确字节长度发送，二进制安全，数据可含 '\0'）
-// 底层唯一执行 write() 循环的地方；上层辅助函数全部经由它把数据写出去。
-void send_response_len(int client_fd, const void *data, size_t len);
-
-// 发送响应给客户端（RESP 文本，按 '\0' 结尾的 C 字符串发送）
-void send_response(int client_fd, const char *resp);
+// 发送响应给客户端：按明确字节长度发送的底层函数（二进制安全，数据可含 '\0'）
+// 唯一执行 write() 循环（处理部分写入 / EINTR）的地方；上层辅助函数全部经由它发出。
+void send_response(int client_fd, const void *data, size_t len);
 
 // ==================== RESP 编码 / 发送辅助函数 ====================
 // 命令层（commands.c）只允许调用下面这些高层 API 来拼接并发送响应，
-// 禁止直接碰 snprintf / send_response_len 的原始拼接细节——所有“拼接+发送”
-// 逻辑都封装在 server.c 里，全部经由 send_response / send_response_len 发出。
+// 禁止直接碰 snprintf / send_response 的原始拼接细节——所有“拼接+发送”
+// 逻辑都封装在 server.c 里，全部经由 send_response 发出。
 // 每个函数只负责一“种” RESP 数据类型，职责单一、可复用。
 
 // 简单字符串回复  +<s>\r\n   （s 例如 "OK"，不得含 \r\n）

@@ -28,7 +28,7 @@ static int parse_strict_long(const char *s, long *out) {
 // 返回值：1 = 正常响应完成；-1 = 调用方应断开该连接（错误已发出，B8 修复）
 // 说明：本层只负责“调命令 + 调 RESP 辅助函数拼接/发送响应”，
 //       所有拼接细节（snprintf、按长度发二进制数据）都封装在 server.c 的
-//       send_* 辅助函数里，命令层不直接碰 send_response_len。
+//       send_* 辅助函数里，命令层不直接碰 send_response。
 int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文件描述符，解释器，存储器-里面有命令执行代码)
 {
     //空命令

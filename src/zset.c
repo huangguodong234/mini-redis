@@ -21,13 +21,20 @@ ZSet *zset_create(void) {
     return zset;
 }
 
-// 添加元素（委托给跳表，member 为 sds）
+// 添加元素（member 为命令层传来的 sds，只读不接管）
+// ★ 存储边界：本层在此 sdsdup 深拷贝一份（像 storage_set 对哈希表那样），
+//   再把所有权移交给跳表（跳表不再自行拷贝，直接接管）。
 void zset_add(ZSet *zset, sds member, double score) {
     if (!zset || !member) return;
-    skiplist_add(zset->sl, member, score);
+    sds owned = sdsdup(member);        // 深拷贝（二进制安全），所有权移交跳表
+    if (!owned) {
+        fprintf(stderr, "zset_add: sdsdup 失败\n");
+        return;
+    }
+    skiplist_add(zset->sl, owned, score);
 }
 
-// 删除成员（委托给跳表，member 为 sds）
+// 删除成员（查询用 member 只读不接管）
 int zset_rem(ZSet *zset, sds member) {
     if (!zset || !member) return 0;
     return skiplist_del(zset->sl, member);
@@ -48,7 +55,7 @@ double zset_score(ZSet *zset,sds member,bool *found){
     return 0.0;
 }
 
-// 范围查询（跳表版本，返回 sds 数组）
+// 范围查询（对外返回可拥有的 sds 副本；拷贝统一在本层做，跳表只给借用引用）
 sds *zset_range(ZSet *zset, int start, int stop) {
     if(!zset){
         sds *result =malloc(sizeof(sds));
@@ -57,7 +64,26 @@ sds *zset_range(ZSet *zset, int start, int stop) {
         return result;
     }
 
-    return skiplist_range(zset->sl,start ,stop);
+    // 从跳表拿到借用的 member 引用数组（NULL 结尾，元素不 free）
+    sds *borrowed = skiplist_range(zset->sl, start, stop);
+    if(!borrowed) return NULL;
+
+    // 逐个深拷贝成可拥有的副本（所有权归调用方，需逐个 sdsfree + free 数组）
+    int i = 0;
+    while (borrowed[i]) {
+        sds owned = sdsdup(borrowed[i]);
+        if(!owned){
+            // B8 修复：OOM 时不能把 NULL/未初始化值留在结果数组里
+            //（上层 while(member[count]) 会读到垃圾指针崩溃）。
+            // 释放已拷贝部分，归还数组，返回 NULL 走 OOM 断开路径
+            for(int j=0; j<i; j++) sdsfree(borrowed[j]);
+            free(borrowed);
+            return NULL;
+        }
+        borrowed[i] = owned;   // 用副本覆盖借用引用
+        i++;
+    }
+    return borrowed;
 }
 
 

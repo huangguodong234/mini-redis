@@ -12,7 +12,8 @@ typedef struct{
 ZSet *zset_create(void);
 
 // 添加元素（如果 member 已存在，则更新 score）-ZADD命令
-// member 为 sds（二进制安全，跳表接管深拷贝）
+// member 为 sds（二进制安全、只读不接管）；本层 sdsdup 深拷贝后移交跳表持有
+// （存储边界，同 storage_set 对哈希表）
 void zset_add(ZSet *zset, sds member, double score);
 
 // 删除指定成员，成功返回1，不存在返回0-ZREM命令
@@ -25,7 +26,8 @@ double zset_score(ZSet *zset,sds member,bool *found);
 
 // 范围查询：返回 score 排名在 [start, stop] 之间的 member 列表-ZRANGE命令
 // stop 为 -1 表示到最后一个元素
-// 返回的是动态分配的 sds 数组，最后以 NULL 结尾（需逐个 sdsfree + free 数组）
+// ★ 返回的是本层深拷贝出的 sds 数组（每个元素可拥有），最后以 NULL 结尾
+//   （需逐个 sdsfree + free 数组）；OOM 时返回 NULL
 sds *zset_range(ZSet *zset, int start, int stop);
 
 // 释放有序集合

@@ -51,7 +51,9 @@ Skiplist *skiplist_create(void);
 
 // 向跳表中插入/更新节点
 // sl: 跳表结构体指针
-// member: 节点成员名（sds，二进制安全，本表深拷贝接管）
+// member: 节点成员名（sds，二进制安全）。★所有权约定：跳表不拷贝，直接接管
+//         本次传入的 sds（调用方 zset 需已 sdsdup 深拷贝）；若本函数未存储它
+//         （同分提前返回 / 分配失败），会在函数内 sdsfree 归还，调用方不再负责。
 // score: 节点排序分数，跳表按score升序排列
 void skiplist_add(Skiplist *sl,sds member,double score);
 
@@ -65,8 +67,9 @@ int skiplist_del(Skiplist *sl,sds member);
 // sl: 跳表结构体指针
 // start: 起始下标（从0开始）
 // stop: 结束下标
-// 返回值：sds 数组，存放区间内所有member（每个是专属深拷贝，需逐个 sdsfree +
-//         再 free 数组本身）；最后以 NULL 结尾
+// ★ 借用语义：返回的数组里每个元素是内部节点的 member 引用（非拷贝、不拥有），
+//   数组以 NULL 结尾。调用方（zset_range）不得 sdsfree/修改这些元素，
+//   需要可拥有的副本时自行 sdsdup；数组本身（malloc 出的指针数组）可 free。
 sds *skiplist_range(Skiplist *sl,int start,int stop);
 
 // 根据成员名查找节点

@@ -94,10 +94,10 @@ void free_client(Client *c) {
     free(c);
 }
 
-// 发送 len 字节给客户端（基础实现）
+// 发送 len 字节给客户端（底层唯一执行 write() 循环的发送函数）
 // 循环 write，处理部分写入和 EINTR（信号打断），保证整条响应发完，RESP 协议不截断
-// data 按明确长度发送，二进制安全（内容可含 '\0'）
-void send_response_len(int client_fd, const void *data, size_t len){
+// data 按明确字节长度发送，二进制安全（内容可含 '\0'）
+void send_response(int client_fd, const void *data, size_t len){
     if(!data || len == 0) return;
     const char *p = data;
     while (len > 0) {
@@ -111,24 +111,17 @@ void send_response_len(int client_fd, const void *data, size_t len){
     }
 }
 
-// 发送响应给客户端（RESP 文本，按 '\0' 结尾的 C 字符串发送）
-// 内部等价 send_response_len(fd, resp, strlen(resp))
-void send_response(int client_fd,const char*resp){
-    if(!resp) return;
-    send_response_len(client_fd, resp, strlen(resp));
-}
-
 // ==================== RESP 编码 / 发送辅助函数 ====================
 // 每个函数把一种 RESP 数据类型的“拼接 + 发送”封装成一步，命令层只调这些 API。
-// 所有文本头都经 snprintf 造好再交给 send_response / send_response_len 发出；
-// 二进制数据段（可能含 '\0'）一律用 send_response_len 按长度发送，绝不 %s。
+// 所有文本头都经 snprintf 造好再交给 send_response 发出；
+// 二进制数据段（可能含 '\0'）一律按长度 send_response 发送，绝不 %s。
 
 // 简单字符串  +<s>\r\n
 void send_simple_string(int client_fd, const char *s){
     if(!s) return;
     char buf[256];
     int n = snprintf(buf, sizeof(buf), "+%s\r\n", s);   // "OK" → "+OK\r\n"
-    if (n > 0) send_response_len(client_fd, buf, (size_t)n);
+    if (n > 0) send_response(client_fd, buf, (size_t)n);
 }
 
 // 错误  -<msg>\r\n
@@ -136,23 +129,23 @@ void send_error(int client_fd, const char *msg){
     if(!msg) return;
     char buf[256];
     int n = snprintf(buf, sizeof(buf), "-%s\r\n", msg);
-    if (n > 0) send_response_len(client_fd, buf, (size_t)n);
+    if (n > 0) send_response(client_fd, buf, (size_t)n);
 }
 
 // 整数  :<n>\r\n
 void send_integer(int client_fd, long n){
     char buf[32];
     int len = snprintf(buf, sizeof(buf), ":%ld\r\n", n);
-    send_response_len(client_fd, buf, (size_t)len);
+    send_response(client_fd, buf, (size_t)len);
 }
 
 // 批量字符串（按明确长度）：$<len>\r\n<data>\r\n，二进制安全
 void send_bulk_string_len(int client_fd, const void *data, size_t len){
     char hdr[32];
     int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
-    send_response_len(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
-    send_response_len(client_fd, data, len);         // 数据（按长度，二进制安全）
-    send_response_len(client_fd, "\r\n", 2);         // 尾部
+    send_response(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
+    send_response(client_fd, data, len);         // 数据（按长度，二进制安全）
+    send_response(client_fd, "\r\n", 2);         // 尾部
 }
 
 // 批量字符串（sds 版）：val == NULL → $-1\r\n，否则按 sdslen 发完整数据
@@ -164,21 +157,21 @@ void send_bulk_string(int client_fd, sds val){
     char hdr[32];
     size_t len = sdslen(val);
     int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
-    send_response_len(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
-    send_response_len(client_fd, val, len);          // 数据（按长度，二进制安全）
-    send_response_len(client_fd, "\r\n", 2);         // 尾部
+    send_response(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
+    send_response(client_fd, val, len);          // 数据（按长度，二进制安全）
+    send_response(client_fd, "\r\n", 2);         // 尾部
 }
 
 // 空批量字符串  $-1\r\n
 void send_null_bulk(int client_fd){
-    send_response(client_fd, "$-1\r\n");
+    send_response(client_fd, "$-1\r\n", 6);
 }
 
 // 数组头  *<n>\r\n
 void send_array_len(int client_fd, long n){
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "*%ld\r\n", n);
-    send_response_len(client_fd, buf, (size_t)len);
+    send_response(client_fd, buf, (size_t)len);
 }
 
 /*

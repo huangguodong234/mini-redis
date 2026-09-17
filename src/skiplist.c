@@ -68,15 +68,21 @@ SkipNode *skiplist_find(Skiplist *sl, sds member) {
 }
 
 // ==================== 插入/更新 ====================
+// 所有权约定：跳表不拷贝 member，直接接管调用方移交的 sds（已在 zset 层
+// sdsdup 深拷贝过）。若本次不存储该 sds（同分提前返回 / 分配失败），
+// 会在本函数内 sdsfree 归还，保证不泄漏。
 void skiplist_add(Skiplist *sl,sds member,double score){
     //先检查member是否存在，再记录前驱指针
     //防止删除节点时删掉的节点刚好是前驱指针
     //避免插入时前驱指针指向已删除的内存
 
-    // 1. 检查 member 是否已存在（用 skiplist_find 按 member 查找）
+    // 1. 检查 member 是否已存在（用 skiplist_find 按 member 内容查找）
     SkipNode *existing=skiplist_find(sl,member);
     if(existing){
-        if(existing->score==score) return;
+        if(existing->score==score){
+            sdsfree(member);      // 同分不存储：把 zset 移交来的所有权归还（防泄漏）
+            return;
+        }
         else{
             skiplist_del(sl,member); //删除旧节点（重新排序）
         }
@@ -112,20 +118,16 @@ void skiplist_add(Skiplist *sl,sds member,double score){
     SkipNode *new_node =malloc(sizeof(SkipNode));
     if(!new_node){
         fprintf(stderr, "skiplist_add: malloc SkipNode 失败\n");
+        sdsfree(member);      // 未存储，归还 zset 移交来的所有权
         return;
     }
-    new_node ->member=sdsdup(member);   // 深拷贝为 sds（二进制安全），所有权归本表
-    if(!new_node->member){
-        fprintf(stderr, "skiplist_add: sdsdup member 失败\n");
-        free(new_node);
-        return;
-    }
+    new_node ->member=member;   // 直接接管 zset 深拷贝好的 sds（二进制安全），所有权归本表
     new_node ->score=score;
     new_node ->level=new_level;
     new_node ->forward=malloc(sizeof(SkipNode *)*new_level);
     if(!new_node->forward){
         fprintf(stderr, "skiplist_add: malloc forward 失败\n");
-        sdsfree(new_node->member);
+        sdsfree(new_node->member);   // 未存储，归还所有权
         free(new_node);
         return;
     }
@@ -191,10 +193,13 @@ int skiplist_del(Skiplist *sl, sds member) {
 }
 
 // ==================== 范围查询 ====================
-// 按排名从 start 到 stop 返回 member sds 数组
+// 按排名从 start 到 stop 返回 member 的 sds 数组
 // start 和 stop 是索引（从0开始），stop 可以为 -1 表示最后一个
-// 返回的数组以 NULL 结尾，调用者需 sdsfree 每个元素并 free 数组本身
-//有更快的方法，在每个节点额外存储 span 信息，但我们先简化
+// ★ 借用语义：返回的数组里每个元素是表内部节点的 member 指针（借用的引用），
+//   不是拷贝。调用方（zset_range）不得直接 sdsfree/修改它们；需要可拥有的
+//   副本时由 zset 层自行 sdsdup。
+//   返回的数组以 NULL 结尾；数组本身需 free，但元素不 free。
+// 有更快的方法，在每个节点额外存储 span 信息，但我们先简化
 sds *skiplist_range(Skiplist *sl, int start, int stop) {
     if(!sl){
         sds *result=malloc(sizeof(sds));
@@ -232,18 +237,10 @@ sds *skiplist_range(Skiplist *sl, int start, int stop) {
         curr=curr->forward[0];
     }
 
-    // 收集 count 个元素
+    // 收集 count 个元素（借用的引用，不拷贝）
     int collected=0;
     for(int i=0 ;i<count && curr;i++){
-        result[i]=sdsdup(curr->member);
-        if(!result[i]){
-            // B8 修复：sdsdup 失败不能把 NULL/未初始化值留在结果数组里
-            // （上层 while(member[count]) 会读到垃圾指针崩溃）。
-            // 释放已收集的部分，返回 NULL，让 commands.c 走 OOM 断开路径
-            for(int j=0;j<i;j++) sdsfree(result[j]);
-            free(result);
-            return NULL;
-        }
+        result[i]=curr->member;   // 借用内部节点的 member，所有权仍归跳表
         collected++;
         curr=curr->forward[0];
     }
