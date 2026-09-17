@@ -16,5 +16,9 @@ hB
 # 压测输出 CSV
 *.csv
 
+# Python 缓存
+__pycache__/
+*.pyc
+
 # 环境痕迹
 .git-cloned-via.txt
