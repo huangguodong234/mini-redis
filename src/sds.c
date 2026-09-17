@@ -13,7 +13,7 @@
 
 static inline size_t sdslen_type(const sds s, char type) {
     switch (type & SDS_TYPE_MASK) {
-        case SDS_TYPE_5:  return (size_t)(s[-1] >> SDS_TYPE_BITS);
+        case SDS_TYPE_5:  return (size_t)((unsigned char)s[-1] >> SDS_TYPE_BITS);
         case SDS_TYPE_8:  return sds_hdr8(s)->len;
         case SDS_TYPE_16: return sds_hdr16(s)->len;
         case SDS_TYPE_32: return sds_hdr32(s)->len;

@@ -12,3 +12,9 @@ bench_client
 # 临时文件
 hB
 /tmp
+
+# 压测输出 CSV
+*.csv
+
+# 环境痕迹
+.git-cloned-via.txt

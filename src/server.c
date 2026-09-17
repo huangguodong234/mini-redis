@@ -169,9 +169,11 @@ void send_bulk_string(int client_fd, sds val){
     send_response(client_fd, "\r\n", 2);         // 尾部
 }
 
-// 空批量字符串  $-1\r\n
+// 空批量字符串  $-1\r\n  （注意：$-1\r\n 只有 5 字节，发送长度传 5，
+//                         若误传 strlen("$-1\r\n")=6 会把结尾 '\0' 也发出去，
+//                         在回复流里多播一个 NUL 字节，破坏二进制精确客户端）
 void send_null_bulk(int client_fd){
-    send_response(client_fd, "$-1\r\n", 6);
+    send_response(client_fd, "$-1\r\n", 5);
 }
 
 // 数组头  *<n>\r\n：n 是 long，十进制位数数学上有界（≤20 位），小数组足够

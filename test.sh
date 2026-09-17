@@ -259,6 +259,75 @@ rcli DEL spk      >/dev/null 2>&1
 rcli DEL inline_k >/dev/null 2>&1
 echo ""
 
+# ---------- 6. 二进制安全（SDS 核心能力，C 字符串版做不到） ----------
+# 说明：raw_send 走 "逐行 read + 去 \r"，遇到 \0 / 多行 bulk 内容会失真，
+#       所以二进制与超长值用例改用 py_roundtrip（Python 直接 socket，二进制精确读写）。
+echo "--- 6. 二进制安全 ---"
+py_roundtrip() {  # $1=描述  $2=python 代码(定义 send()/expect() 返回 bytes)
+    local desc="$1" code="$2" rc
+    local out
+    out=$(HOST="$HOST" PORT="$PORT" python3 - "$code" <<'PYEOF'
+import os, sys, socket
+code = sys.argv[1]
+HOST, PORT = os.environ['HOST'], int(os.environ['PORT'])
+s = socket.create_connection((HOST, PORT), timeout=3)
+ns = {}
+exec(code, ns)
+s.sendall(ns['send']())
+s.settimeout(2)
+buf = b''
+try:
+    while True:
+        d = s.recv(65536)
+        if not d: break
+        buf += d
+except socket.timeout:
+    pass
+s.close()
+expect = ns['expect']()
+if buf == expect:
+    sys.stdout.write("OK")
+else:
+    sys.stdout.write("MISMATCH want_len=%d got_len=%d want_head=%r got_head=%r" %
+                     (len(expect), len(buf), expect[:20], buf[:20]))
+PYEOF
+)
+    assert_eq "$desc" "OK" "$out"
+}
+
+# 1. 值中间含 \0：SET bin1 "A\x00xy"（长度4），回读必须原样还原 4 字节
+py_roundtrip "binary value SET/GET (含\\0)" \
+'send=lambda: b"*3\r\n$3\r\nSET\r\n$4\r\nbin1\r\n$4\r\nA\x00xy\r\n*2\r\n$3\r\nGET\r\n$4\r\nbin1\r\n"
+expect=lambda: b"+OK\r\n$4\r\nA\x00xy\r\n"'
+
+# 2. ZADD 二进制 member（m\x00k）
+py_roundtrip "binary member ZADD+ZSCORE" \
+'send=lambda: b"*4\r\n$4\r\nZADD\r\n$4\r\nbinz\r\n$4\r\n42.5\r\n$3\r\nm\x00k\r\n*3\r\n$6\r\nZSCORE\r\n$4\r\nbinz\r\n$3\r\nm\x00k\r\n"
+expect=lambda: b"+OK\r\n$4\r\n42.5\r\n"'
+
+# ---------- 7. 大值（>1KB，旧版固定 1KB 缓冲区装不下，SDS 动态扩容） ----------
+echo "--- 7. 大值/超 1KB 缓冲 ---"
+# 2000 字节值：旧版固定 char[1024] 在 read 到 1KB 就会截断，SDS 可整段拼接还原
+py_roundtrip "SET/GET 2000B value (超 1KB)" \
+'send=lambda: b"*3\r\n$3\r\nSET\r\n$7\r\nbigkey1\r\n$2000\r\n"+b"x"*2000+b"\r\n*2\r\n$3\r\nGET\r\n$7\r\nbigkey1\r\n"
+expect=lambda: b"+OK\r\n$2000\r\n"+b"x"*2000+b"\r\n"'
+
+# 8192 字节值：验证动态扩容 + 多段 read 拼接
+py_roundtrip "SET/GET 8192B value (动态扩容)" \
+'send=lambda: b"*3\r\n$3\r\nSET\r\n$7\r\nbigkey2\r\n$8192\r\n"+b"y"*8192+b"\r\n*2\r\n$3\r\nGET\r\n$7\r\nbigkey2\r\n"
+expect=lambda: b"+OK\r\n$8192\r\n"+b"y"*8192+b"\r\n"'
+
+# 320KB 大值（接近 sdsMakeRoomFor 的 1MB 阈值的分段扩容路径）
+py_roundtrip "SET/GET 320KB value (阈值扩容)" \
+'send=lambda: b"*3\r\n$3\r\nSET\r\n$7\r\nbigkey3\r\n$327680\r\n"+b"z"*327680+b"\r\n*2\r\n$3\r\nGET\r\n$7\r\nbigkey3\r\n"
+expect=lambda: b"+OK\r\n$327680\r\n"+b"z"*327680+b"\r\n"'
+
+# 用 redis-cli 清理大键
+rcli DEL bigkey1 >/dev/null 2>&1
+rcli DEL bigkey2 >/dev/null 2>&1
+rcli DEL bigkey3 >/dev/null 2>&1
+echo ""
+
 # ---------- 最终结果统计 ----------
 # 清理可能残留的边界测试键，避免下次运行受影响
 rcli ZREM myzset cherry >/dev/null 2>&1
