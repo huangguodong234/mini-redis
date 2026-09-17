@@ -54,12 +54,12 @@ Skiplist *skiplist_create(void){
 // ==================== 查找节点 ==================== 现在是用循环的方法来查找，O(n),待优化
 // 根据 member 查找节点，返回节点指针，找不到返回 NULL
 // 对：返回节点指针 SkipNode*
-SkipNode *skiplist_find(Skiplist *sl, const char *member) {
+SkipNode *skiplist_find(Skiplist *sl, sds member) {
     if(!sl || !member) return NULL;
-    // 在第0层顺序查找（按 member 精确匹配）
+    // 在第0层顺序查找（按 member 精确匹配，sdscmp 二进制安全）
     SkipNode *curr=sl->header->forward[0];
     while(curr){
-        if(strcmp(curr->member,member)==0){
+        if(sdscmp(curr->member, member)==0){
             return curr;
         }
         curr=curr->forward[0];
@@ -68,7 +68,7 @@ SkipNode *skiplist_find(Skiplist *sl, const char *member) {
 }
 
 // ==================== 插入/更新 ====================
-void skiplist_add(Skiplist *sl,const char*member,double score){
+void skiplist_add(Skiplist *sl,sds member,double score){
     //先检查member是否存在，再记录前驱指针
     //防止删除节点时删掉的节点刚好是前驱指针
     //避免插入时前驱指针指向已删除的内存
@@ -92,12 +92,12 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
         //并且 (score更小) 或 (score相同但member字符串更小)
         while(curr->forward[i] && (curr->forward[i]->score < score || 
             (curr->forward[i]->score==score && 
-            strcmp(curr->forward[i]->member ,member)<0))){
+            sdscmp(curr->forward[i]->member ,member)<0))){
                 curr=curr->forward[i];
         }
         update[i]=curr; // 记录该层前驱
     }
-   
+    
     // 3. member 不存在（或被删除了），创建新节点
     int new_level =random_level();
     // 如果新节点的层数超过当前最大层，更新 max_level
@@ -114,9 +114,9 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
         fprintf(stderr, "skiplist_add: malloc SkipNode 失败\n");
         return;
     }
-    new_node ->member=strdup(member);
+    new_node ->member=sdsdup(member);   // 深拷贝为 sds（二进制安全），所有权归本表
     if(!new_node->member){
-        fprintf(stderr, "skiplist_add: strdup member 失败\n");
+        fprintf(stderr, "skiplist_add: sdsdup member 失败\n");
         free(new_node);
         return;
     }
@@ -125,7 +125,7 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
     new_node ->forward=malloc(sizeof(SkipNode *)*new_level);
     if(!new_node->forward){
         fprintf(stderr, "skiplist_add: malloc forward 失败\n");
-        free(new_node->member);
+        sdsfree(new_node->member);
         free(new_node);
         return;
     }
@@ -141,7 +141,7 @@ void skiplist_add(Skiplist *sl,const char*member,double score){
 // ==================== 删除节点 ====================
 // 根据 member 删除跳表中的节点
 // 成功返回 1，节点不存在返回 0
-int skiplist_del(Skiplist *sl, const char *member) {
+int skiplist_del(Skiplist *sl, sds member) {
     if(!sl || !member) return 0;
 
     // 先查找目标节点，获取它的 score
@@ -158,7 +158,7 @@ int skiplist_del(Skiplist *sl, const char *member) {
         //并且 (score更小) 或 (score相同但member字符串更小)
         while(curr->forward[i] && (curr->forward[i]->score < score || 
             (curr->forward[i]->score==score && 
-            strcmp(curr->forward[i]->member ,member)<0))){
+            sdscmp(curr->forward[i]->member ,member)<0))){
                 curr=curr->forward[i];
         }
         update[i]=curr; // 记录该层前驱
@@ -177,8 +177,8 @@ int skiplist_del(Skiplist *sl, const char *member) {
         }
     }
 
-    // 4. 释放节点内存
-    free(curr->member);
+    // 4. 释放节点内存（member 是 sds）
+    sdsfree(curr->member);
     free(curr->forward);
     free(curr);
     sl->size--;
@@ -191,13 +191,13 @@ int skiplist_del(Skiplist *sl, const char *member) {
 }
 
 // ==================== 范围查询 ====================
-// 按排名从 start 到 stop 返回 member 字符串数组
+// 按排名从 start 到 stop 返回 member sds 数组
 // start 和 stop 是索引（从0开始），stop 可以为 -1 表示最后一个
-// 返回的数组以 NULL 结尾，调用者需要释放数组中每个字符串以及数组本身
+// 返回的数组以 NULL 结尾，调用者需 sdsfree 每个元素并 free 数组本身
 //有更快的方法，在每个节点额外存储 span 信息，但我们先简化
-char **skiplist_range(Skiplist *sl, int start, int stop) {
+sds *skiplist_range(Skiplist *sl, int start, int stop) {
     if(!sl){
-        char **result=malloc(sizeof(char*));
+        sds *result=malloc(sizeof(sds));
         if(!result) return NULL;
         result[0]=NULL;
         return result;
@@ -213,7 +213,7 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
 
     // 无效范围
     if(start >stop || start >=sl->size){
-        char **result=malloc(sizeof(char *));
+        sds *result=malloc(sizeof(sds));
         if(!result) return NULL;
         result[0]=NULL;
         return result;
@@ -223,7 +223,7 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
     if (stop >= sl->size) stop = sl->size - 1;
 
     int count=stop-start+1;
-    char **result=malloc(sizeof(char*)*(count +1)); // +1 放 NULL
+    sds *result=malloc(sizeof(sds)*(count +1)); // +1 放 NULL
     if(!result) return NULL;
 
     // 从头节点第0层走到第一个
@@ -235,12 +235,12 @@ char **skiplist_range(Skiplist *sl, int start, int stop) {
     // 收集 count 个元素
     int collected=0;
     for(int i=0 ;i<count && curr;i++){
-        result[i]=strdup(curr->member);
+        result[i]=sdsdup(curr->member);
         if(!result[i]){
-            // B8 修复：strdup 失败不能把 NULL/未初始化值留在结果数组里
+            // B8 修复：sdsdup 失败不能把 NULL/未初始化值留在结果数组里
             // （上层 while(member[count]) 会读到垃圾指针崩溃）。
             // 释放已收集的部分，返回 NULL，让 commands.c 走 OOM 断开路径
-            for(int j=0;j<i;j++) free(result[j]);
+            for(int j=0;j<i;j++) sdsfree(result[j]);
             free(result);
             return NULL;
         }
@@ -260,13 +260,13 @@ void skiplist_free(Skiplist *sl){
     // 1. 释放所有业务节点
     while(curr){
         SkipNode *next=curr->forward[0];
-        free(curr->member);
+        sdsfree(curr->member);
         free(curr->forward);
         free(curr);
         curr=next;
     }
-    // 2. 释放头节点
-    free(sl->header->member);
+    // 2. 释放头节点（member 为 NULL，sdsfree(NULL) 安全）
+    sdsfree(sl->header->member);
     free(sl->header->forward);
     free(sl->header);
 

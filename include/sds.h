@@ -85,7 +85,8 @@
  *    好处：连续多次小拼接，前几次都落在"已有多余空间"里，不必
  *    每次 realloc，均摊到每次 append 是 O(1)（平摊分析）。
 
- * ② 惰性空间释放（sdsclear）
+ * ② 惰性空间释放（sdsclear，本质：把内存留在**同一个 sds 自己**手里，
+ *    不是"释放后给别的同大小对象用"——那是 malloc/free 层面的池化复用）
  *    清空/截断时不急着把 alloc 缩回去，只把 len 归 0。下次再拼
  *    接直接复用这块空间，避免"用完就缩、缩完又扩"的反复 malloc。
 
@@ -219,18 +220,6 @@ static inline size_t sdsHdrSize(char type) {
     return 0; /* 不可达 */
 }
 
-/* 某类型里 len 字段的位宽（TYPE_5 特殊：无独立 len，返回 0） */
-static inline size_t sdsTypeLenSize(char type) {
-    switch (type & SDS_TYPE_MASK) {
-        case SDS_TYPE_5:  return 0;   /* len 藏在 flags 里 */
-        case SDS_TYPE_8:  return 1;
-        case SDS_TYPE_16: return 2;
-        case SDS_TYPE_32: return 4;
-        case SDS_TYPE_64: return 8;
-    }
-    return 0;
-}
-
 /* 从 sds 数据指针反推类型。
  * flags 总是紧挨在数据前面 1 字节，s[-1] 低 3 位就是类型。 */
 static inline char sds_type(const sds s) {
@@ -284,7 +273,8 @@ sds sdsdup(const sds s);
 /* 释放整块内存（header + 数据一起）。释放后 s 不可再用。 */
 void sdsfree(sds s);
 
-/* 清空内容但保留已分配容量（len 归 0，alloc 不变）——惰性释放，
+/* 清空内容但保留已分配容量（len 归 0，alloc 不变）——惰性释放
+ * （把内存留在同一个 sds 自己手里供下次 append 复用，而非还给系统），
  * 下次 append 直接复用这块空间。 */
 void sdsclear(sds s);
 

@@ -94,12 +94,12 @@ void free_client(Client *c) {
     free(c);
 }
 
-// 发送响应给客户端（我们直接发送 RESP 格式字符串）
+// 发送 len 字节给客户端（基础实现）
 // 循环 write，处理部分写入和 EINTR（信号打断），保证整条响应发完，RESP 协议不截断
-void send_response(int client_fd,const char*resp){
-    if(!resp) return;
-    size_t len = strlen(resp);
-    const char *p = resp;
+// data 按明确长度发送，二进制安全（内容可含 '\0'）
+void send_response_len(int client_fd, const void *data, size_t len){
+    if(!data || len == 0) return;
+    const char *p = data;
     while (len > 0) {
         ssize_t n = write(client_fd, p, len);
         if (n < 0) {
@@ -109,6 +109,13 @@ void send_response(int client_fd,const char*resp){
         p += n;
         len -= (size_t)n;
     }
+}
+
+// 发送响应给客户端（RESP 文本，按 '\0' 结尾的 C 字符串发送）
+// 内部等价 send_response_len(fd, resp, strlen(resp))
+void send_response(int client_fd,const char*resp){
+    if(!resp) return;
+    send_response_len(client_fd, resp, strlen(resp));
 }
 
 /*
@@ -194,11 +201,16 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
         }
 
         // 追加到 sds 缓冲区尾部（sds 会自动扩容，多帧半包都能拼接完整）
-        c->querybuf = sdscatlen(c->querybuf, rbuf, (size_t)nread);
-        if (!c->querybuf) {
+        // 先存到临时变量：sdscatlen OOM 时返回 NULL 但不释放旧 sds，
+        // 若直接赋给 c->querybuf 会因 NULL 覆盖而丢失旧指针，造成泄漏
+        sds nb = sdscatlen(c->querybuf, rbuf, (size_t)nread);
+        if (!nb) {
+            sdsfree(c->querybuf);   // 旧指针还在手上，主动释放，避免 OOM 泄漏
+            c->querybuf = NULL;     // 置 NULL，free_client 的 sdsfree(NULL) 为安全 no-op
             fprintf(stderr, "客户端 %d 缓冲区扩容失败\n", c->fd);
             break;
         }
+        c->querybuf = nb;
 
         // 3. 调用第二层解析（处理粘包/半包）
         int prc = processInputBuffer(c, store, zset);

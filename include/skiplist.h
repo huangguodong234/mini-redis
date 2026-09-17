@@ -1,11 +1,12 @@
 #ifndef SKIPLIST_H
 #define SKIPLIST_H
 
+#include "sds.h"
+
 /*我的跳表和Redis的跳表的区别：
 *   1.跳表结构体的不同：
 *      （1）我的跳表结构体是一个单向链表，而Redis 跳表在第 0 层有 backward 后退指针，所以支持从尾向头遍历。但高层只有 forward，所以它本质是"双向跳表 + 第 0 层双向"。
-*      （2）我的跳表节点是直接存member字符串，而Redis是直接存sds结构体。
-*      （3）我是每层都单独记前进指针和层数，而Redis是创建一个level结构体，把前进指针和span字段（节点跨度）放进去。
+*      （2）我是每层都单独记前进指针和层数，而Redis是创建一个level结构体，把前进指针和span字段（节点跨度）放进去。
 *           
 *        优点：
 *        (1) redis用双向链表，可以处理正序和逆序访问。
@@ -17,14 +18,6 @@
 *    2.从member查询score的方式不同：
 *      我的是通过for循环，在跳表的第0层的链表里通过遍历的方式来查找score，
 *      而Redis是通过查找哈希表来查找score的。使得查找效率从O(n)-->O(1)
-*     
-*    为什么设计两种释放内存方式？
-*
-*    情况 A（node == NULL）：最常见的删除，比如用户执行 ZREM key member。Redis 找到节点，摘下来，释放内存，完事。
-*    情况 B（node != NULL）：调用者想复用这个已经分配好的节点和它的 SDS 字符串。比如：
-*    删除某个元素后，想把它插入到另一个跳表里（不需要重新分配内存和复制字符串）。
-*    批量删除操作中，调用者统一管理释放时机。
-*    这是一种避免重复 malloc/free 的优化——节点和 SDS 已经分配好了，直接"移交"给调用者复用，省掉释放 + 重新分配的开销。
 */ 
 
 /*   核心差异：
@@ -38,7 +31,7 @@
 
 // 跳表节点
 typedef struct SkipNode{
-    char *member;                  //成员名
+    sds member;                    //成员名（sds，二进制安全）
     double score;                 //跳表中所有节点按 score 从小到大排列。  
     struct SkipNode **forward;     //forward[i] 的含义：在第 i 层上，
                                    //指向当前的下一个 score 大于本节点的节点。
@@ -58,26 +51,28 @@ Skiplist *skiplist_create(void);
 
 // 向跳表中插入/更新节点
 // sl: 跳表结构体指针
-// member: 节点成员名（唯一标识）
+// member: 节点成员名（sds，二进制安全，本表深拷贝接管）
 // score: 节点排序分数，跳表按score升序排列
-void skiplist_add(Skiplist *sl,const char *member,double score);
+void skiplist_add(Skiplist *sl,sds member,double score);
 
 // 根据成员名删除跳表中的节点（暂时不需要实现，先声明）
 // sl: 跳表结构体指针
-// member: 待删除的成员名
+// member: 待删除的成员名（sds，只读不接管）
 // 返回值：删除成功返回1，节点不存在/失败返回0
-int skiplist_del(Skiplist *sl,const char *member);
+int skiplist_del(Skiplist *sl,sds member);
 
 // 范围查询，按顺序截取区间内所有成员名
 // sl: 跳表结构体指针
 // start: 起始下标（从0开始）
 // stop: 结束下标
-// 返回值：字符串数组，存放区间内所有member；需调用方手动释放内存
-char **skiplist_range(Skiplist *sl,int start,int stop);
+// 返回值：sds 数组，存放区间内所有member（每个是专属深拷贝，需逐个 sdsfree +
+//         再 free 数组本身）；最后以 NULL 结尾
+sds *skiplist_range(Skiplist *sl,int start,int stop);
 
 // 根据成员名查找节点
 // 返回值：成功返回节点指针，找不到返回 NULL
-SkipNode *skiplist_find(Skiplist *sl,const char *member);  // 修正：加上分号，返回类型改为 SkipNode *
+// member: 查询用 sds，只读不接管
+SkipNode *skiplist_find(Skiplist *sl,sds member);
 
 // 释放整个跳表所有节点及内存，防止内存泄漏
 // sl: 待销毁的跳表结构体指针

@@ -7,16 +7,15 @@
 // ============================================================
 // storage.c —— mini-redis 存储引擎
 // ============================================================
-// ★ 这里就是 C 字符串 <-> sds 的转换边界：
-//   - server / commands 层传进来的是 const char *（C 字符串）
-//   - 本层把它们拷贝成 sds，再交给纯 sds 世界的哈希表
-//   - 这样转换点集中、一眼可见；哈希表内部不再做任何转换
+// ★ 存储边界：接口直接收 sds（server/commands 层传进来的就是 sds，
+//   二进制安全）。本层做深拷贝后交给纯 sds 的哈希表。
 //
 //   生命周期约定：
-//   - set：本层建好的 k/v sds 在调用 hashtable_set 后，所有权
-//           移交给哈希表（由 hashtable_free / hashtable_del 释放），
+//   - set：本层把 k/v 用 sdsdup 深拷贝一份，调用 hashtable_set 后
+//           所有权移交给哈希表（由 hashtable_free / hashtable_del 释放），
 //           本层此后不得再 sdsfree 它们。
-//   - get/del：查询用 sds 是临时量，用完后在本层就地 sdsfree。
+//   - get/del：查询用 sds 是调用方传入的临时量，本层只读不接管、
+//           不释放（调用方自己负责）。
 
 // 初始化存储引擎
 Storage *storage_init() {
@@ -36,19 +35,18 @@ Storage *storage_init() {
 }
 
 // SET 命令的实现
-// ★ C 字符串 -> sds 的转换（拷贝）就发生在这里
-void storage_set(Storage *s, const char *key, const char *value) {
+// ★ key/value 已是 sds（二进制安全），深拷贝后交给哈希表
+void storage_set(Storage *s, sds key, sds value) {
     // 参数检查：避免意外传入 NULL 导致崩溃
     if(!s || !key ||!value) return;
 
-    // 把 C 字符串转成 sds（这是持久数据，必须拷贝一份，
-    // 因为 server 层传进来的内存生命周期是函数级的）
-    sds k = sdsnew(key);
-    sds v = sdsnew(value);
+    // 深拷贝成 sds（这是持久数据，必须拷贝一份，因为调用方后续会释放自己的）
+    sds k = sdsdup(key);
+    sds v = sdsdup(value);
     if(!k || !v){
         sdsfree(k);   // 释放已成功的那一个
         sdsfree(v);
-        fprintf(stderr, "storage_set: sdsnew 失败\n");
+        fprintf(stderr, "storage_set: sdsdup 失败\n");
         return;
     }
 
@@ -56,29 +54,16 @@ void storage_set(Storage *s, const char *key, const char *value) {
     hashtable_set(s->ht,k,v);
 }
 
-// GET 命令的实现
-char *storage_get(Storage *s, const char *key) {
+// GET 命令的实现（key 只读不接管；返回内部 value 的 sds，调用方不要 free）
+sds storage_get(Storage *s, sds key) {
     if(!s || !key) return NULL;
-
-    // 临时查询 sds，用完就地释放
-    sds k = sdsnew(key);
-    if(!k) return NULL;
-
-    char *val = hashtable_get(s->ht,k);
-    sdsfree(k);          // 临时 sds 用完释放
-    return val;
+    return hashtable_get(s->ht,key);
 }
 
-// DEL 命令的实现
-int storage_del(Storage *s, const char *key) {
+// DEL 命令的实现（key 只读不接管）
+int storage_del(Storage *s, sds key) {
     if(!s || !key) return 0;
-
-    sds k = sdsnew(key);
-    if(!k) return 0;
-
-    int result = hashtable_del(s->ht,k);
-    sdsfree(k);          // 临时 sds 用完释放
-    return result;
+    return hashtable_del(s->ht,key);
 }
 
 // 释放所有内存

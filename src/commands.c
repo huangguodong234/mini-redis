@@ -49,7 +49,7 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
             return 1;
         }
 
-        char *key=cmd->argv[1];     // ZSET 的键名（暂未实现多键，先忽略，直接使用全局 zset）
+        sds key=cmd->argv[1];     // ZSET 的键名（暂未实现多键，先忽略，直接使用全局 zset）
         (void)key;                  // 避免编译警告
 
         // 严格校验 score（B9 修复）：atof("abc") 会静默变 0.0；atof("nan") 得到 NaN，
@@ -66,7 +66,7 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
         }
         // 注：±inf 放行，与 Redis 行为一致（inf 可作合法边界分数）
 
-        char *member=cmd->argv[3];
+        sds member=cmd->argv[3];
         zset_add(zset,member,score);
         send_response(client_fd, "+OK\r\n");
         return 1;
@@ -79,9 +79,9 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
             send_response(client_fd, "-ERR wrong number of arguments for 'ZREM'\r\n");
             return 1;
         }
-        char *key=cmd->argv[1];
+        sds key=cmd->argv[1];
         (void)key;
-        char *member=cmd->argv[2];
+        sds member=cmd->argv[2];
         int result=zset_rem(zset,member);
         char response[16];
         snprintf(response,sizeof(response),":%d\r\n",result);
@@ -95,9 +95,9 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
             send_response(client_fd, "-ERR wrong number of arguments for 'ZSCORE'\r\n");
             return 1;
         }
-        char *key=cmd->argv[1];
+        sds key=cmd->argv[1];
         (void)key;
-        char *member=cmd->argv[2];
+        sds member=cmd->argv[2];
         bool found =false;
         double score=zset_score(zset,member,&found);
         if(!found){
@@ -133,7 +133,7 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
         int start =(int)start_l;
         int stop =(int)stop_l;
 
-        char **member =zset_range(zset,start,stop);
+        sds *member =zset_range(zset,start,stop);
         if(!member){
             // B8 修复：分配失败。响应一个字节都还没发，无协议失步，
             // 但 OOM 下不应继续服务，报错并断开
@@ -151,23 +151,15 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
         snprintf(header,sizeof(header),"*%d\r\n",count);
         send_response(client_fd,header);
 
-        // 发送每个成员（批量字符串）
+        // 发送每个成员（批量字符串，二进制安全：sdslen 取长 + 按长度发，避免 %s 截断）
         for(int i=0;i<count;i++){
-            size_t len = strlen(member[i]);
-            size_t item_size = len + 32;  // 格式开销 + 内容
-            char *item = malloc(item_size);
-            if(!item){
-                // B8 修复：数组头 *N 已经发出，无法补全完整数组，
-                // 客户端必然失步 → 发错误并断开（旧实现 free+continue 会永久失步）
-                send_response(client_fd, "-ERR out of memory\r\n");
-                for(int j = i; j < count; j++) free(member[j]);  // 释放还没发出的成员串
-                free(member);
-                return -1;
-            } //避免item太小，导致格式化字符串溢出，让RESP协议中断
-            snprintf(item, item_size, "$%zu\r\n%s\r\n", len, member[i]);
-            send_response(client_fd, item);
-            free(item);
-            free(member[i]);
+            size_t len = sdslen(member[i]);
+            char hdr[32];
+            int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
+            send_response_len(client_fd, hdr, (size_t)hl);   // header（纯文本长度行）
+            send_response_len(client_fd, member[i], len);    // 数据（二进制安全）
+            send_response_len(client_fd, "\r\n", 2);         // trailer
+            sdsfree(member[i]);
         }
         free(member);
         return 1;
@@ -191,21 +183,17 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
             send_response(client_fd,"-ERR wrong number of arguments for 'GET'\r\n");
             return 1;
         }
-        char *val= storage_get(store,cmd->argv[1]);
+        sds val= storage_get(store,cmd->argv[1]);
 
         if(val){
-            size_t len = strlen(val);
-            size_t resp_size = len + 32;
-            char *response = malloc(resp_size);
-            if(!response){
-                fprintf(stderr, "GET: malloc response 失败\n");
-                send_response(client_fd, "-ERR out of memory\r\n");
-                // 单行错误响应是完整的，连接未失步，保留连接
-                return 1;
-            }
-            snprintf(response, resp_size, "$%zu\r\n%s\r\n", len, val);
-            send_response(client_fd, response);
-            free(response);
+            // 用 sdslen 取长度 + send_response_len 按长度发送 → 二进制安全（值可含 '\0'）
+            // RESP 批量字符串 = $<len>\r\n<len字节数据>\r\n，三段发送，避免 %s 在 '\0' 截断
+            size_t len = sdslen(val);
+            char hdr[32];
+            int hl = snprintf(hdr,sizeof(hdr),"$%zu\r\n",len);
+            send_response_len(client_fd, hdr, (size_t)hl);   // header（长度总是文本，无 \0）
+            send_response_len(client_fd, val, len);          // 数据（按 sdslen，二进制安全）
+            send_response_len(client_fd, "\r\n", 2);         // trailer
         }
         else {
             send_response(client_fd, "$-1\r\n");

@@ -21,20 +21,20 @@ ZSet *zset_create(void) {
     return zset;
 }
 
-// 添加元素（委托给跳表）
-void zset_add(ZSet *zset, const char *member, double score) {
+// 添加元素（委托给跳表，member 为 sds）
+void zset_add(ZSet *zset, sds member, double score) {
     if (!zset || !member) return;
     skiplist_add(zset->sl, member, score);
 }
 
-// 删除成员（委托给跳表）
-int zset_rem(ZSet *zset, const char *member) {
+// 删除成员（委托给跳表，member 为 sds）
+int zset_rem(ZSet *zset, sds member) {
     if (!zset || !member) return 0;
     return skiplist_del(zset->sl, member);
 }
 
 //指定成员 member 对应的分数（score）。
-double zset_score(ZSet *zset,const char *member,bool *found){
+double zset_score(ZSet *zset,sds member,bool *found){
     if(!zset || !member) {
         *found=false; //起标记的作用，用于判断成员是否存在
         return 0.0;
@@ -48,10 +48,10 @@ double zset_score(ZSet *zset,const char *member,bool *found){
     return 0.0;
 }
 
-// 范围查询（跳表版本）
-char **zset_range(ZSet *zset, int start, int stop) {
+// 范围查询（跳表版本，返回 sds 数组）
+sds *zset_range(ZSet *zset, int start, int stop) {
     if(!zset){
-        char **result =malloc(sizeof(char*));
+        sds *result =malloc(sizeof(sds));
         if(!result) return NULL;
         result[0]=NULL;
         return result;

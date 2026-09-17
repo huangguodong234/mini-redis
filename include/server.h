@@ -31,8 +31,11 @@ Client *create_client(int fd);
 // 释放客户端（关闭连接并释放内存）
 void free_client(Client *c);
 
-// 发送响应给客户端
+// 发送响应给客户端（RESP 文本，按 '\0' 结尾的 C 字符串发送）
 void send_response(int client_fd, const char *resp);
+
+// 发送响应给客户端（按明确字节长度发送，二进制安全，数据可含 '\0'）
+void send_response_len(int client_fd, const void *data, size_t len);
 
 // 创建服务器 socket（已绑定并监听）
 int create_server_socket(int port, int backlog);
