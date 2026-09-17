@@ -79,10 +79,14 @@ mini-redis/
 │   ├── test_skiplist.c # 跳表功能测试
 │   └── test_zset.c   # 有序集合测试
 ├── test.sh           # 自动化回归测试脚本（40 用例，支持 HOST/PORT/SKIP_BUILD 覆盖）
-├── bench_focus.py    # 聚焦压测（固定流水线深度测 SET/GET/大值 QPS，sds vs 无sds 对比）
-├── bench_ping_curve.py # PING 流水线深度缩放曲线
-├── bench_latency.py   # 延迟分布压测（多档位大值 SET/GET 的 min/avg/p50/p99 延迟，sds vs 无sds）
-├── correctness_probe.py # 二进制安全 / 大值正确性探针
+├── bench/            # 压测与探针脚本合集
+│   ├── bench.sh         # redis-benchmark 多命令/多并发/多数据量压测
+│   ├── bench_py.py      # 流水线吞吐 + 延迟分布快测
+│   ├── bench_collect.py # 多流水线深度/多命令/多负载 QPS → CSV
+│   ├── bench_focus.py   # 聚焦压测（固定流水线深度 SET/GET/大值 QPS，sds vs 无sds 对比）
+│   ├── bench_ping_curve.py # PING 流水线深度缩放曲线
+│   ├── bench_latency.py   # 延迟分布（多档位大值 SET/GET 的 min/avg/p50/p99，sds vs 无sds）
+│   └── correctness_probe.py # 二进制安全 / 大值正确性探针
 ├── Makefile
 └── README.md
 ```
@@ -362,7 +366,7 @@ SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层�
 - 拷贝边界对齐：zset_add 内 `sdsdup` 深拷贝、所有权移交给跳表；zset_range 深拷贝出可拥有副本
 - 全量测试 **35 → 40 用例**，全部通过
 - 压测对比 SDS vs 无 SDS，结论写入本文档
-- 新增延迟分布压测 `bench_latency.py`：多档位大值（8B~128KB）的 SET/GET min/avg/p50/p99 延迟。结论：小命令（≤512B）无 SDS 延迟低约 10%–25%；**≥1KB 起无 SDS 因固定 1024 缓冲溢出崩溃，仅 SDS 能稳定服务**（详阅「极限压测 · 延迟与多档位大值」小节）
+- 新增延迟分布压测 `bench/bench_latency.py`：多档位大值（8B~128KB）的 SET/GET min/avg/p50/p99 延迟。结论：小命令（≤512B）无 SDS 延迟低约 10%–25%；**≥1KB 起无 SDS 因固定 1024 缓冲溢出崩溃，仅 SDS 能稳定服务**（详阅「极限压测 · 延迟与多档位大值」小节）
 
 **阶段 3：有序集合（6.13 - 6.25）**
 

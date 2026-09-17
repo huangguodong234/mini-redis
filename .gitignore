@@ -22,3 +22,4 @@ __pycache__/
 
 # 环境痕迹
 .git-cloned-via.txt
+.vscode/
