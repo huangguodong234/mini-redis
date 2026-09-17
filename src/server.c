@@ -118,6 +118,69 @@ void send_response(int client_fd,const char*resp){
     send_response_len(client_fd, resp, strlen(resp));
 }
 
+// ==================== RESP 编码 / 发送辅助函数 ====================
+// 每个函数把一种 RESP 数据类型的“拼接 + 发送”封装成一步，命令层只调这些 API。
+// 所有文本头都经 snprintf 造好再交给 send_response / send_response_len 发出；
+// 二进制数据段（可能含 '\0'）一律用 send_response_len 按长度发送，绝不 %s。
+
+// 简单字符串  +<s>\r\n
+void send_simple_string(int client_fd, const char *s){
+    if(!s) return;
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "+%s\r\n", s);   // "OK" → "+OK\r\n"
+    if (n > 0) send_response_len(client_fd, buf, (size_t)n);
+}
+
+// 错误  -<msg>\r\n
+void send_error(int client_fd, const char *msg){
+    if(!msg) return;
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "-%s\r\n", msg);
+    if (n > 0) send_response_len(client_fd, buf, (size_t)n);
+}
+
+// 整数  :<n>\r\n
+void send_integer(int client_fd, long n){
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), ":%ld\r\n", n);
+    send_response_len(client_fd, buf, (size_t)len);
+}
+
+// 批量字符串（按明确长度）：$<len>\r\n<data>\r\n，二进制安全
+void send_bulk_string_len(int client_fd, const void *data, size_t len){
+    char hdr[32];
+    int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
+    send_response_len(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
+    send_response_len(client_fd, data, len);         // 数据（按长度，二进制安全）
+    send_response_len(client_fd, "\r\n", 2);         // 尾部
+}
+
+// 批量字符串（sds 版）：val == NULL → $-1\r\n，否则按 sdslen 发完整数据
+void send_bulk_string(int client_fd, sds val){
+    if(!val){
+        send_null_bulk(client_fd);
+        return;
+    }
+    char hdr[32];
+    size_t len = sdslen(val);
+    int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
+    send_response_len(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
+    send_response_len(client_fd, val, len);          // 数据（按长度，二进制安全）
+    send_response_len(client_fd, "\r\n", 2);         // 尾部
+}
+
+// 空批量字符串  $-1\r\n
+void send_null_bulk(int client_fd){
+    send_response(client_fd, "$-1\r\n");
+}
+
+// 数组头  *<n>\r\n
+void send_array_len(int client_fd, long n){
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "*%ld\r\n", n);
+    send_response_len(client_fd, buf, (size_t)len);
+}
+
 /*
 *服务端流程：创建socket(int domain（地址族）,int type（套接字类型）,int protocol（传输协议）我们填 0-TCP)，绑定端口(bing(套接字描述符,地址结构体指针, 地址结构体的大小)),
 *开始监听（listen（套接字描述符, 等待队列最大长度））接受客户端的连接（accept(监听的套接字描述符，客户端地址结构体指针, 客户端地址长度变量的指针)）,
@@ -267,7 +330,7 @@ int processInputBuffer(Client *c,Storage *store, ZSet *zset){
             break;
         }else if(rc == -1){
             // 协议错误，发送错误并断开/清空缓冲区
-            send_response(c->fd, "-ERR protocol error\r\n");
+            send_error(c->fd, "ERR protocol error");
             return -1;
         }else if(rc == -2){
             // 命令层要求断开（如 OOM），错误响应已在命令层发出，直接断开
