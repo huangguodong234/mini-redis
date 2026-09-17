@@ -112,36 +112,43 @@ void send_response(int client_fd, const void *data, size_t len){
 }
 
 // ==================== RESP 编码 / 发送辅助函数 ====================
-// 每个函数把一种 RESP 数据类型的“拼接 + 发送”封装成一步，命令层只调这些 API。
-// 所有文本头都经 snprintf 造好再交给 send_response 发出；
-// 二进制数据段（可能含 '\0'）一律按长度 send_response 发送，绝不 %s。
+// 每个函数把一种 RESP 数据类型“分段发送”封装成一步，命令层只调这些 API。
+// 统一思路：不像 Redis 那样攒进输出缓冲（它们是非阻塞事件循环，必须缓冲续写；
+// 我们阻塞式单线程，一次调用就能把整条响应写完），而是把 RESP 拆成
+// 前缀/内容/后缀几段，逐段 send_response 直接写出：
+//   - 固定字面量（":"、"$"、"\r\n" 等）直接发；
+//   - 长度不定的字符串（s / msg / val 数据）按 strlen/sdslen 按长度发，绝不 %s；
+//   - 数字只用一个“数学上有上界”的小临时数组装 ASCII（long/size_t 十进制
+//     最多 20 位 + 符号，24 字节足够），不存在“长度未知的固定数组”截断隐患。
+// 这样既规避了不定长固定数组，又省掉了“临时建一块 sds 再释放”的开销。
 
-// 简单字符串  +<s>\r\n
+// 简单字符串  +<s>\r\n：分三段  "+"  s  "\r\n"
 void send_simple_string(int client_fd, const char *s){
     if(!s) return;
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "+%s\r\n", s);   // "OK" → "+OK\r\n"
-    if (n > 0) send_response(client_fd, buf, (size_t)n);
+    send_response(client_fd, "+", 1);
+    send_response(client_fd, s, strlen(s));   // s 长度任意，按长度发
+    send_response(client_fd, "\r\n", 2);
 }
 
-// 错误  -<msg>\r\n
+// 错误  -<msg>\r\n：分三段  "-"  msg  "\r\n"
 void send_error(int client_fd, const char *msg){
     if(!msg) return;
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "-%s\r\n", msg);
-    if (n > 0) send_response(client_fd, buf, (size_t)n);
+    send_response(client_fd, "-", 1);
+    send_response(client_fd, msg, strlen(msg));   // msg 长度任意，按长度发
+    send_response(client_fd, "\r\n", 2);
 }
 
-// 整数  :<n>\r\n
+// 整数  :<n>\r\n：n 是 long，十进制位数数学上有界（≤20 位），小数组足够
 void send_integer(int client_fd, long n){
-    char buf[32];
-    int len = snprintf(buf, sizeof(buf), ":%ld\r\n", n);
-    send_response(client_fd, buf, (size_t)len);
+    char num[24];
+    int len = snprintf(num, sizeof(num), ":%ld\r\n", n);
+    send_response(client_fd, num, (size_t)len);
 }
 
-// 批量字符串（按明确长度）：$<len>\r\n<data>\r\n，二进制安全
+// 批量字符串（按明确长度）：$<len>\r\n + <data> + \r\n，二进制安全
+// len 是 size_t，十进制位数数学上有界（≤20 位），片段依次发送
 void send_bulk_string_len(int client_fd, const void *data, size_t len){
-    char hdr[32];
+    char hdr[24];
     int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
     send_response(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
     send_response(client_fd, data, len);         // 数据（按长度，二进制安全）
@@ -154,7 +161,7 @@ void send_bulk_string(int client_fd, sds val){
         send_null_bulk(client_fd);
         return;
     }
-    char hdr[32];
+    char hdr[24];
     size_t len = sdslen(val);
     int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
     send_response(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
@@ -167,11 +174,11 @@ void send_null_bulk(int client_fd){
     send_response(client_fd, "$-1\r\n", 6);
 }
 
-// 数组头  *<n>\r\n
+// 数组头  *<n>\r\n：n 是 long，十进制位数数学上有界（≤20 位），小数组足够
 void send_array_len(int client_fd, long n){
-    char buf[32];
-    int len = snprintf(buf, sizeof(buf), "*%ld\r\n", n);
-    send_response(client_fd, buf, (size_t)len);
+    char num[24];
+    int len = snprintf(num, sizeof(num), "*%ld\r\n", n);
+    send_response(client_fd, num, (size_t)len);
 }
 
 /*
