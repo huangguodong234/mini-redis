@@ -228,3 +228,48 @@ int sdscmp(const sds s1, const sds s2) {
     if (cmp != 0) return cmp;
     return (l1 > l2) ? 1 : (l1 < l2) ? -1 : 0;
 }
+
+/* 截取 sds 的子串并就地覆盖 s：保留 [start,end]（含端点）。
+ * start/end 支持负数（-1 表示最后一个字符，从尾部倒数）。
+ * 越界会被裁剪到合法范围；范围内无字符则清空。
+ * 只做 memmove + 更新 len 字段，不动 header 类型、不重新分配（复用原空间）。
+ * 返回 self，方便链式调用。 */
+sds sdsrange(sds s, long start, long end) {
+    size_t newlen;
+    size_t len = sdslen(s);
+    if (len == 0) return s;
+    if (start < 0) {
+        start = (long)len + start;
+        if (start < 0) start = 0;
+    }
+    if (end < 0) {
+        end = (long)len + end;
+        if (end < 0) end = 0;
+    }
+    newlen = (start > end) ? 0 : (size_t)(end - start + 1);
+    if (newlen != 0) {
+        if (start >= (long)len) {
+            newlen = 0;
+        } else if ((size_t)end >= len) {
+            end = (long)len - 1;
+            newlen = (start > end) ? 0 : (size_t)(end - start + 1);
+        }
+    }
+    if (start != 0 && newlen != 0) {
+        memmove(s, s + start, newlen);
+    }
+    s[newlen] = '\0';
+
+    /* 更新 len 字段（TYPE_5 的 len 存 flags 高 5 位） */
+    char type = sds_type(s);
+    switch (type & SDS_TYPE_MASK) {
+        case SDS_TYPE_5:
+            s[-1] = (char)((newlen << SDS_TYPE_BITS) | SDS_TYPE_5);
+            break;
+        case SDS_TYPE_8:  sds_hdr8(s)->len = (uint8_t)newlen;  break;
+        case SDS_TYPE_16: sds_hdr16(s)->len = (uint16_t)newlen; break;
+        case SDS_TYPE_32: sds_hdr32(s)->len = (uint32_t)newlen; break;
+        case SDS_TYPE_64: sds_hdr64(s)->len = (uint64_t)newlen; break;
+    }
+    return s;
+}

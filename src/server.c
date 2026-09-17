@@ -67,14 +67,17 @@ Client *create_client(int fd){
 
     c->fd=fd;
     c->qb_pos=0;
-    c->qb_len=0;
+    c->querybuf = sdsempty();   // 用 sds 动态缓冲区，自动扩容，无固定大小限制
+    if (!c->querybuf) {         // OOM：释放并返回 NULL
+        free(c);
+        return NULL;
+    }
     c->multibulklen = 0;
     c->bulklen = -1;
     c->cmd_start = 0;
     c->argv = NULL;
     c->argc = 0;
     c->argv_max = 0;
-    memset(c->querybuf,0,BUFFER_SIZE); //缓冲区清空
 
     return c;
 }
@@ -83,9 +86,10 @@ Client *create_client(int fd){
 void free_client(Client *c) {
     if (!c) return;
     if (c->argv) {
-        for (int i = 0; i < c->argc; i++) free(c->argv[i]);
+        for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);   // 每个元素是 sds
         free(c->argv);
     }
+    sdsfree(c->querybuf);       // 释放 sds 缓冲区
     close(c->fd);
     free(c);
 }
@@ -158,8 +162,8 @@ int create_server_socket(int port, int backlog){
  * 对应 Redis 的 readQueryFromClient
  *
  * 职责：
- *   1. 创建 Client 结构体，封装 fd、缓冲区、游标
- *   2. 循环从 socket 读取数据，追加到 querybuf 尾部
+ *   1. 创建 Client 结构体，封装 fd、sds 缓冲区、游标
+ *   2. 循环从 socket 读取数据，追加到 querybuf（sds）尾部
  *   3. 每次读取后调用 processInputBuffer（第二层）尝试解析命令
  *   4. 客户端断开或出错时退出循环，释放 Client
  */
@@ -172,18 +176,11 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
         return;
     }
 
-    int nread = 0;   // 初始化：若首轮循环因缓冲区满（avail==0）直接跳出，nread 也不可未定义
-    // 2. 循环读取数据
+    int nread = 0;   // 初始化：若首轮循环直接跳出，nread 也不可未定义
+    char rbuf[4096]; // 临时读缓冲；读到的数据用 sdscatlen 追加到 sds，可任意拼接
+    // 2. 循环读取数据（读入临时缓冲，再追加到 sds——不再受固定大小限制）
     while(1){
-        // 计算剩余空间（预留1字节给'\0'）
-        size_t avail = BUFFER_SIZE - c->qb_len - 1;
-        if (avail == 0) {
-            // 缓冲区满，此处简单断开（后续可改为扩容）
-            fprintf(stderr, "客户端 %d 缓冲区已满\n", c->fd);
-            break;
-        }
-
-        nread=read(c->fd,c->querybuf + c->qb_len,avail);
+        nread=read(c->fd, rbuf, sizeof(rbuf));
         if(nread<0){
             // B7 修复：被信号打断（SIGINT/调试器 attach 等）nread<0,不是客户端断开，
             // 继续读即可；真正的读错误才退出
@@ -196,9 +193,12 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
             break;   // 客户端断开
         }
 
-        // 更新缓冲区长度并追加结束符
-        c->qb_len +=nread;
-        c->querybuf[c->qb_len]='\0';
+        // 追加到 sds 缓冲区尾部（sds 会自动扩容，多帧半包都能拼接完整）
+        c->querybuf = sdscatlen(c->querybuf, rbuf, (size_t)nread);
+        if (!c->querybuf) {
+            fprintf(stderr, "客户端 %d 缓冲区扩容失败\n", c->fd);
+            break;
+        }
 
         // 3. 调用第二层解析（处理粘包/半包）
         int prc = processInputBuffer(c, store, zset);
@@ -233,7 +233,7 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
  */
 int processInputBuffer(Client *c,Storage *store, ZSet *zset){
     // 循环解析：只要游标后面还有数据，就尝试解析命令（处理粘包）
-    while(c->qb_pos < c->qb_len){
+    while((size_t)c->qb_pos < sdslen(c->querybuf)){
         // 按解析状态分流（不能只看首字节！）：
         //   1) multibulklen > 0 说明一条 RESP 命令正跨多次 read 解析中（上次的半包），
         //      当前游标处的字节是该命令的参数（$L...），必须继续走 multibulk 状态机——
@@ -264,12 +264,9 @@ int processInputBuffer(Client *c,Storage *store, ZSet *zset){
     }
 
     // 缓冲区压缩：把已解析完的无用数据移除
+    // 用 sdsrange 把 [qb_pos, len-1] 的未处理数据整体移到头部（只 memmove + 改 len）
     if (c->qb_pos > 0){
-        if(c->qb_pos < c->qb_len){
-            // 还有未处理的数据，移到缓冲区头部
-            memmove(c->querybuf, c->querybuf + c->qb_pos, c->qb_len - c->qb_pos);
-        }
-        c->qb_len -= c->qb_pos;
+        sdsrange(c->querybuf, (long)c->qb_pos, -1);
         c->qb_pos = 0;
     }
     return 1;
@@ -311,13 +308,13 @@ int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
 
         // 防御性清理 argv（如果之前残留）
         if (c->argv) {
-            for (int i = 0; i < c->argc; i++) free(c->argv[i]);
+            for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
             free(c->argv);
             c->argv = NULL;
             c->argv_max = 0;
             c->argc = 0;
         }
-        c->argv = malloc(argc * sizeof(char *));
+        c->argv = malloc(argc * sizeof(sds));
         if (!c->argv) {
             c->multibulklen = 0;
             return -1;
@@ -331,7 +328,7 @@ int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
         // 半包保护：游标已到缓冲区末尾（头部 *N 已解析、参数数据还没到齐）时，
         // 绝不能去读 '\0' 终止符再喂给 parse_bulk_header（那会被当成协议错误）——
         // 返回 0 等下次 read 补齐数据。TCP 不保证一次 read 收到完整命令。
-        if (c->qb_pos >= c->qb_len) return 0;
+        if ((size_t)c->qb_pos >= sdslen(c->querybuf)) return 0;
         p = c->querybuf + c->qb_pos;
         // 状态二：解析 $L\r\n
         if (c->bulklen == -1) {
@@ -343,10 +340,10 @@ int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
             c->qb_pos = next - c->querybuf;
         }
 
-        // 状态三：提取内容
+        // 状态三：提取内容（sds，二进制安全）
         p = c->querybuf + c->qb_pos;
-        char *content = NULL;
-        rc = extract_bulk_content(p, c->bulklen, &content, &next, c->querybuf + c->qb_len);
+        sds content = NULL;
+        rc = extract_bulk_content(p, c->bulklen, &content, &next, c->querybuf + sdslen(c->querybuf));
         if (rc == 0) return 0;
         if (rc < 0)  return -1;
 
@@ -362,8 +359,8 @@ int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
     cmd.argv = c->argv;
     int hrc = handle_command(c->fd, &cmd, store, zset);
 
-    // 释放 argv
-    for (int i = 0; i < c->argc; i++) free(c->argv[i]);
+    // 释放 argv（每个元素是 sds）
+    for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
     free(c->argv);
     c->argv = NULL;
     c->argc = 0;
@@ -387,7 +384,7 @@ int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
  */
 int processInlineCommand(Client *c, Storage *store, ZSet *zset) {
     const char *p = c->querybuf + c->qb_pos;
-    const char *buf_end = c->querybuf + c->qb_len;
+    const char *buf_end = c->querybuf + sdslen(c->querybuf);
 
     // 找行结束符（\r\n 或裸 \n 都认）
     const char *line_end = memchr(p, '\n', (size_t)(buf_end - p));
@@ -416,10 +413,10 @@ int processInlineCommand(Client *c, Storage *store, ZSet *zset) {
         return 1;
     }
 
-    char **argv = malloc(argc * sizeof(char *));
+    sds *argv = malloc(argc * sizeof(sds));
     if (!argv) return -1;                         // OOM，断开
 
-    // 第二遍：逐个复制 token
+    // 第二遍：逐个构建 token（sds，二进制安全）
     int idx = 0;
     size_t i = 0;
     while (idx < argc && i < line_len) {
@@ -427,15 +424,13 @@ int processInlineCommand(Client *c, Storage *store, ZSet *zset) {
         size_t start = i;
         while (i < line_len && p[i] != ' ' && p[i] != '\t') i++;
         size_t tok_len = i - start;
-        char *tok = malloc(tok_len + 1);
-        if (!tok) {
-            for (int j = 0; j < idx; j++) free(argv[j]);
+        argv[idx] = sdsnewlen(p + start, tok_len);
+        if (!argv[idx]) {
+            for (int j = 0; j < idx; j++) sdsfree(argv[j]);
             free(argv);
             return -1;                            // OOM，断开
         }
-        memcpy(tok, p + start, tok_len);
-        tok[tok_len] = '\0';
-        argv[idx++] = tok;
+        idx++;
     }
 
     Command cmd;
@@ -443,8 +438,8 @@ int processInlineCommand(Client *c, Storage *store, ZSet *zset) {
     cmd.argv = argv;
     int hrc = handle_command(c->fd, &cmd, store, zset);
 
-    // 释放 argv（无论命令成败都要释放）
-    for (int j = 0; j < argc; j++) free(argv[j]);
+    // 释放 argv（无论命令成败都要释放，每个元素是 sds）
+    for (int j = 0; j < argc; j++) sdsfree(argv[j]);
     free(argv);
 
     // 游标越过本行（含行结束符）

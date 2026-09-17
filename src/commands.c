@@ -33,7 +33,7 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
         send_response(client_fd,"-ERR no command\r\n");
         return 1;
     }
-    char *cmd_name =cmd->argv[0];    // 命令名，比如 "SET"
+    char *cmd_name =cmd->argv[0];    // 命令名，比如 "SET"（sds，当 C 字符串用）
 
     //PING 命令-检测两台设备之间网络通不通、延迟高不高
     if(strcasecmp(cmd_name,"PING")==0){

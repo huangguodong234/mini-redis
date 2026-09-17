@@ -8,6 +8,11 @@ typedef struct {
     HashTable *ht; // 底层存储变成哈希表
 } Storage;
 
+// ★ 本层是 C 字符串 <-> sds 的转换边界：
+//   接口对外仍收 const char *（server/commands 层不变）；
+//   内部把 key/value 拷贝成 sds 再交给纯 sds 的哈希表。set 时
+//   所有权移交给哈希表，get/del 的查询 sds 用后在本层释放。
+
 // 创建并初始化存储引擎
 Storage *storage_init();
 

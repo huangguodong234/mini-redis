@@ -1,6 +1,8 @@
 #ifndef HASHTABLE_H
 #define HASHTABLE_H
 
+#include "sds.h"    // 键/值改用 SDS 存储（二进制安全、O(1) 长度）
+
 /* ============================================================
  * mini-redis 对照 Redis 8.0.6 源码阅读笔记
  * 模块：哈希表 (dict)
@@ -11,7 +13,8 @@
  * 一、key 存储方式的设计权衡
  * ============================================================
  *
- * 我的 mini-redis:用 char * 固定死，只能处理原生 C 字符串，无法记录长度等信息。
+ * 我的 mini-redis:键值已改用 SDS 存储，获取长度 O(1) 且二进制安全。
+ *             （历史版本用 char * 固定死，只能处理原生 C 字符串。）
  *
  * Redis:底层 dictEntry 的 key 定义为 void *，这是为了把 dict 打造成通用工具
  *         （通过 dictType 支持内部多种映射场景）。
@@ -22,7 +25,7 @@
  * 这两种方式的区别是：
  *
  * 1. 数据存储的基础形态：
- *    我的 mini-redis:直接使用原生的 char * 存储键和值。
+ *    我的 mini-redis:用 SDS 存储键和值（也具备二进制安全、O(1) 长度）。
  *    Redis:将字符串包装成 SDS 结构体。因为 SDS 是"二进制安全"的，
  *           所以可以存储图片、视频等任何包含 \0 的二进制数据流。
  *
@@ -209,16 +212,17 @@ dictAdd → _dictExpandIfNeeded  ← 函数一：检查负载因子
  */
 
 /*  核心差异：
-*       void *key + dictType 多态 vs char *key 硬编码
-*       union v 内联存储 vs char *value 指针
+*       void *key + dictType 多态 vs sds key 硬编码（已用 SDS，但类型写死）
+*       union v 内联存储 vs sds value 指针（已用 SDS，但仍是独立指针）
 *       渐进式 rehash（双表 + rehashidx）vs 一次性搬迁
 *       8.0 特有：ht_size_exp 指数存大小
 */
 
-// 哈希表节点（链表节点）
+// 哈希表节点（链表节点）；key/value 都是 sds，由调用方（storage）拷贝传入，
+// 哈希表接管所有权并负责最终释放
 typedef struct HashNode{
-    char *key;
-    char *value;
+    sds key;
+    sds value;
     struct HashNode *next;    // 指向下一个节点
 }HashNode;
 
@@ -229,20 +233,19 @@ typedef struct{
     int capacity;         // 桶的数量
 }HashTable;
 
-// djb2 哈希函数
-unsigned long hash_djb2(const char *str);
-
 // 创建哈希表，initial_capacity 是初始桶数
 HashTable *hashtable_create(int initial_capacity);
 
 //插入或更新键值对-SET命令
-void hashtable_set(HashTable *ht,const char*key,const char *value);
+// key/value 为 sds，由本表接管所有权（存储后由 hashtable_free/del 释放）
+void hashtable_set(HashTable *ht,sds key,sds value);
 
-//查找 key，返回 value 指针（找不到返回 NULL）-GET命令
-char *hashtable_get(HashTable *ht,const char *key);
+//查找 key，返回内部 value 指针（sds，本质 char*，外部不要 free；找不到返回 NULL）-GET命令
+// key 为查询用 sds，只读不接管
+char *hashtable_get(HashTable *ht,sds key);
 
-// 删除 key，返回 1 成功，0 不存在-DEL命令
-int hashtable_del(HashTable *ht,const char *key);
+// 删除 key，返回 1 成功，0 不存在-DEL命令（key 只读不接管）
+int hashtable_del(HashTable *ht,sds key);
 
 //销毁哈希表，释放所有内存
 void hashtable_free(HashTable*ht);

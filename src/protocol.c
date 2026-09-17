@@ -5,6 +5,7 @@
 #include <string.h>    //strlen() strncpy() strcmp()  strcpy()
 #include <ctype.h>     //isdigit()  判断字符是否是数字
 #include "protocol.h"    //我们自己的头文件
+#include "sds.h"         // extract_bulk_content 要返回 sds
 
 // ===== 公开的辅助函数，供 processMultibulkBuffer 调用 =====
 
@@ -65,15 +66,13 @@ int parse_bulk_header(const char *p, const char **next, long *len) {
  * p 指向内容开头，len 是内容长度
  * 如果缓冲区数据还没到齐，返回 0（半包，等待下次 read）
  * 如果数据已完整但结尾不是 \r\n，返回 -1（协议错误）
- * 否则提取内容到 *out（调用者负责 free），*next 指向内容末尾之后
+ * 否则提取内容为 sds 到 *out（调用者负责 sdsfree），*next 指向内容末尾之后
  */
-int extract_bulk_content(const char *p, long len, char **out, const char **next, const char *buf_end) {
+int extract_bulk_content(const char *p, long len, sds *out, const char **next, const char *buf_end) {
     if (p + len + 2 > buf_end) return 0;                       //半包（数据不够）
     if (p[len] != '\r' || p[len+1] != '\n') return -1;         //数据够但格式不对 → 协议错误
-    *out = malloc(len + 1);
-    if (!*out) return -1;                                       // malloc 失败按错误处理（避免解引用 NULL）
-    memcpy(*out, p, len);
-    (*out)[len] = '\0';
+    *out = sdsnewlen(p, (size_t)len);                          // 直接构造 sds（二进制安全）
+    if (!*out) return -1;                                       // 分配失败按错误处理
     *next = p + len + 2;
     return 1;
 }
