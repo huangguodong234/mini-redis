@@ -139,7 +139,7 @@ flowchart TD
 
     D -- "SET" --> S1["storage_set_steal（默认）<br/>key/value 的 sds 所有权<b>直接移交</b>哈希表<br/>两格 argv 置 NULL，省两次 sdsdup+两次 sdsfree"]
     D -- "GET" --> G1["storage_get 返回<b>借用</b> sds<br/>(内部指针,调用方不可 free)"]
-    D -- "ZADD" --> Z1["zset_add 深拷贝<br/><code>sdsdup(member)</code><br/>所有权 → 跳表"]
+    D -- "ZADD" --> Z1["zset_add steal<br/>member 所有权<b>直接移交</b>跳表<br/><code>argv[3] 置 NULL</code>"]
     D -- "ZRANGE" --> Z2["zset_range 深拷贝<br/>逐个 sdsdup → 可拥有数组<br/>调用方逐个 free"]
     D -- "PING/ZREM/DEL" --> O1["直接应答或整数结果"]
 
@@ -403,14 +403,16 @@ SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层�
 
 `c->argv` 是**指针数组壳**（`malloc` 的 `sds*`），每个槽**指向**一块 `extract_bulk_content` 用 `sdsnewlen` 从 querybuf 独立 `malloc` 出来的数据 sds——两块不同的内存。命令一结束，`server.c` 就 `sdsfree(c->argv[i]) + free(c->argv)`：数组壳无条件归还，"仍归 server 所有"的数据 sds 也被释放。
 
-所以直接 `hashtable_set(s->ht, argv[1], argv[2])`（既不拷贝、也不转移）是**悬空 bug**：哈希表存的指针指向 `c->argv[1]` 指向的 sds，命令结束它就失效，下次 GET 读到已释放内存。避开它只有两条路，二选一：
+所以直接 `hashtable_set(s->ht, argv[1], argv[2])`（既不拷贝、也不转移）是**悬空 bug**：哈希表存的指针指向 `c->argv[1]` 指向的 sds，命令结束它就失效，下次 GET 读到已释放内存。避开它只有两条路，二选一——**本仓库只保留第二条**（深拷贝版 `storage_set` 已删除）：
 
 | | 存进哈希表的是 | 命令结束后原数据 sds 会怎样 | 结果 |
 |---|---|---|---|
-| **storage_set（旧）** | `sdsdup` 拷的新一份（与 c->argv 无关） | 原 sds 被 server 释放 | 哈希表持拷贝，安全 |
+| **storage_set（旧，已删除）** | `sdsdup` 拷的新一份（与 c->argv 无关） | 原 sds 被 server 释放 | 哈希表持拷贝，安全 |
 | **storage_set_steal（现用）** | `argv[i]` 指向的原 sds 本身 | 已被接管，槽置 NULL 不再释放 | 哈希表持原件，安全 |
 
-关键纪律：**每块 sds 恰好一个 owner**。steal 是"改 owner + 把登记表那格清掉"（`argv[1]=argv[2]=NULL`，`sdsfree(NULL)` 安全 no-op），既不 double-free 也不悬空；哈希表在 duplicate-key / OOM 拒绝路径自行释放传入的 sds，同样闭环。ASAN + LeakSanitizer 全路径零泄漏即证。
+**SET 和 ZADD 现在都走 steal**：`storage_set_steal` 把哈希表的 key/value 直接接管，`zset_add` 不再 sdsdup、直接把 member 交给跳表（`skiplist_add` 直接持有，duplicate/同分/OOM 路径自行 `sdsfree`），命令层都各自把 `argv[i]` 置 NULL。
+
+关键纪律：**每块 sds 恰好一个 owner**。steal 是"改 owner + 把登记表那格清掉"（`argv[1]=argv[2]=NULL` / `argv[3]=NULL`，`sdsfree(NULL)` 安全 no-op），既不 double-free 也不悬空；哈希表/跳表在 duplicate/同分/OOM 拒绝路径自行释放传入的 sds，同样闭环。ASAN + LeakSanitizer 全路径零泄漏即证。
 
 ---
 
@@ -479,7 +481,7 @@ SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层�
 - 修复 TYPE_5 有符号 char 位移导致的 16–31 字节崩溃（`(unsigned char)` 强转）
 - 修复 `send_null_bulk` 多发送的 1 字节 `\0`（`"$-1\r\n"` 长度应为 5）
 - send 层改为分段直发，去掉全部不定长固定数组与临时 sds
-- 拷贝边界对齐：zset_add 内 `sdsdup` 深拷贝、所有权移交给跳表；zset_range 深拷贝出可拥有副本
+- 拷贝边界对齐：zset_add 走 steal（member 所有权直接移交跳表，不 sdsdup）、ZADD 分支置 argv[3] 为 NULL；zset_range 深拷贝出可拥有副本
 - 全量测试 **35 → 40 用例**，全部通过
 - 压测对比 SDS vs 无 SDS，结论写入本文档
 - 新增延迟分布压测 `bench/bench_latency.py`：多档位大值（8B~128KB）的 SET/GET min/avg/p50/p99 延迟。结论：小命令（≤512B）无 SDS 延迟低约 10%–30%；**≥1KB 起无 SDS 因固定 1024 缓冲溢出崩溃，仅 SDS 能稳定服务**（详阅「压测与 SDS vs 无 SDS 对比 · 延迟分档」小节）

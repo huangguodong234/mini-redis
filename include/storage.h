@@ -10,15 +10,17 @@ typedef struct {
 
 // ★ 本层是存储边界（不再做 C 字符串 <-> sds 转换）：
 //   接口对外直接收 sds（server/commands 层传进来的就是 sds，二进制安全）；
-//   内部把 key/value 深拷贝成 sds 再交给纯 sds 的哈希表。set 时
-//   所有权移交给哈希表，get/del 的查询 sds 用后在本层释放。
+//   SET 走"所有权转移"（storage_set_steal），key/value 的 sds 所有权移交给
+//   哈希表；get/del 的查询 sds 只读不接管。
 
 // 创建并初始化存储引擎
 Storage *storage_init();
 
 // 设置键值对（如果 key 已存在则更新）-SET命令（加和改数据）
-// key/value 为 sds，本层深拷贝后交给哈希表接管
-void storage_set(Storage *s, sds key, sds value);
+// ★ 所有权转移路径：key/value 为 sds，本层不深拷贝，直接把所有权移交给
+//   哈希表（省掉两次 sdsdup）。调用方（commands 层）必须把自己手里对应的
+//   argv[i] 置 NULL，避免误 free；哈希表在 duplicate-key / OOM 路径自行释放
+//   传入的 sds，故不泄漏。
 void storage_set_steal(Storage *s, sds key, sds value);
 
 // 获取键对应的值，不存在返回 NULL  -GET命令（读和查数据）

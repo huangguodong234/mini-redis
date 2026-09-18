@@ -8,12 +8,13 @@
 // storage.c —— mini-redis 存储引擎
 // ============================================================
 // ★ 存储边界：接口直接收 sds（server/commands 层传进来的就是 sds，
-//   二进制安全）。本层做深拷贝后交给纯 sds 的哈希表。
+//   二进制安全）。
 //
 //   生命周期约定：
-//   - set：本层把 k/v 用 sdsdup 深拷贝一份，调用 hashtable_set 后
-//           所有权移交给哈希表（由 hashtable_free / hashtable_del 释放），
-//           本层此后不得再 sdsfree 它们。
+//   - set：走"所有权转移"（storage_set_steal），本层不深拷贝，直接把
+//           k/v 的 sds 所有权移交给哈希表（由 hashtable_free /
+//           hashtable_del / duplicate-key 覆盖释放），调用方须把对应
+//           argv[i] 置 NULL，本层此后不得再 sdsfree 它们。
 //   - get/del：查询用 sds 是调用方传入的临时量，本层只读不接管、
 //           不释放（调用方自己负责）。
 
@@ -34,32 +35,13 @@ Storage *storage_init() {
     return s;
 }
 
-// SET 命令的实现
-// ★ key/value 已是 sds（二进制安全），深拷贝后交给哈希表
-void storage_set(Storage *s, sds key, sds value) {
-    // 参数检查：避免意外传入 NULL 导致崩溃
-    if(!s || !key ||!value) return;
-
-    // 深拷贝成 sds（这是持久数据，必须拷贝一份，因为调用方后续会释放自己的）
-    sds k = sdsdup(key);
-    sds v = sdsdup(value);
-    if(!k || !v){
-        sdsfree(k);   // 释放已成功的那一个
-        sdsfree(v);
-        fprintf(stderr, "storage_set: sdsdup 失败\n");
-        return;
-    }
-
-    // 拷贝已完成，把 k/v 的所有权交给哈希表（本函数不负责释放）
-    hashtable_set(s->ht,k,v);
-}
-
 // SET 命令的“所有权转移”路径（argv 不释放给哈希）
-// ★ 与 storage_set 的区别：这里不 sdsdup 深拷贝，而是直接把调用方解析出的
-//   key/value sds 的所有权移交给哈希表（省掉每 SET 两次 sdsdup 的 malloc+
-//   memcpy，也省掉 server 层后续对这两个元素的两次 sdsfree）。
+// ★ 唯一的 set 路径：直接接管调用方解析出的 key/value sds 的所有权移交给
+//   哈希表（不深拷贝；省掉每 SET 两次 sdsdup 的 malloc+memcpy，也省掉
+//   server 层后续对这两个元素的两次 sdsfree）。
 //   ⚠ 调用方（commands 层）必须把自己手里对应的 argv[i] 置 NULL，
-//   避免 server.c 误 free（哈希表现在拥有它们）。
+//   避免 server.c 误 free（哈希表现在拥有它们）；哈希表在 duplicate-key /
+//   OOM 拒绝路径自行释放传入的 sds，故不泄漏。
 void storage_set_steal(Storage *s, sds key, sds value) {
     if(!s || !key || !value) return;
     // 所有权直接移交，不再拷贝；hashtable_set 会负责持有，重复 key 时自释放

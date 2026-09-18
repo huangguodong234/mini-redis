@@ -76,6 +76,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
 
         sds member=argv[3];
         zset_add(zset,member,score);
+        argv[3] = NULL;   // 已被跳表接管所有权，调用方（server.c）不得再 free
         send_simple_string(client_fd, "OK");
         return 1;
     }

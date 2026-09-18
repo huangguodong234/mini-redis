@@ -21,17 +21,13 @@ ZSet *zset_create(void) {
     return zset;
 }
 
-// 添加元素（member 为命令层传来的 sds，只读不接管）
-// ★ 存储边界：本层在此 sdsdup 深拷贝一份（像 storage_set 对哈希表那样），
-//   再把所有权移交给跳表（跳表不再自行拷贝，直接接管）。
+// 添加元素（member 为命令层传来的 sds，"所有权转移"路径）
+// ★ 存储边界：本层不再 sdsdup 深拷贝，直接把 member 的 sds 所有权移交给跳表
+//   （skiplist_add 直接接管，失败/同分路径自行 sdsfree）。调用方（commands 层
+//   ZADD 分支）必须把自己手里对应的 argv[i] 置 NULL，避免 server.c 误 free。
 void zset_add(ZSet *zset, sds member, double score) {
     if (!zset || !member) return;
-    sds owned = sdsdup(member);        // 深拷贝（二进制安全），所有权移交跳表
-    if (!owned) {
-        fprintf(stderr, "zset_add: sdsdup 失败\n");
-        return;
-    }
-    skiplist_add(zset->sl, owned, score);
+    skiplist_add(zset->sl, member, score);   // 所有权移交跳表（不再拷贝）
 }
 
 // 删除成员（查询用 member 只读不接管）

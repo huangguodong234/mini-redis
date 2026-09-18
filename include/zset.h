@@ -12,8 +12,9 @@ typedef struct{
 ZSet *zset_create(void);
 
 // 添加元素（如果 member 已存在，则更新 score）-ZADD命令
-// member 为 sds（二进制安全、只读不接管）；本层 sdsdup 深拷贝后移交跳表持有
-// （存储边界，同 storage_set 对哈希表）
+// member 为 sds（二进制安全）；本层直接接管所有权移交跳表（不深拷贝）。
+// ⚠ 调用方必须把自己手里对应的 argv[i] 置 NULL，避免误 free；
+//   跳表在 duplicate/同分/OOM 路径自行释放传入的 sds，故不泄漏。
 void zset_add(ZSet *zset, sds member, double score);
 
 // 删除指定成员，成功返回1，不存在返回0-ZREM命令
