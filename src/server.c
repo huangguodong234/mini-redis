@@ -431,10 +431,7 @@ int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
     }
 
     /* ========== 所有参数提取完毕，执行命令 ========== */
-    Command cmd;
-    cmd.argc = c->argc;
-    cmd.argv = c->argv;
-    int hrc = handle_command(c->fd, &cmd, store, zset);
+    int hrc = handle_command(c->fd, c->argc, c->argv, store, zset);
 
     // 释放 argv（每个元素是 sds）
     for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
@@ -510,10 +507,7 @@ int processInlineCommand(Client *c, Storage *store, ZSet *zset) {
         idx++;
     }
 
-    Command cmd;
-    cmd.argc = argc;
-    cmd.argv = argv;
-    int hrc = handle_command(c->fd, &cmd, store, zset);
+    int hrc = handle_command(c->fd, argc, argv, store, zset);
 
     // 释放 argv（无论命令成败都要释放，每个元素是 sds）
     for (int j = 0; j < argc; j++) sdsfree(argv[j]);

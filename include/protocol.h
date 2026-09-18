@@ -2,13 +2,12 @@
 #ifndef PROTOCOL_H     // 如果没有定义 PROTOCOL_H 这个宏
 #define PROTOCOL_H     //就定义他
 
-#include "sds.h"       // Command.argv 用 sds 存参数
+#include "sds.h"       // 解析出的参数用 sds 存
 
-//定义一个结构体，把解析后的命令打包在一起
-typedef struct{
-    int argc;       //参数个数,数组长度
-    sds *argv;      //参数数组（每个元素是 sds，所有权归创建者）
-}Command;
+// 注：早期版本用 Command{int argc; sds *argv;} 结构体把参数打包传给命令层。
+// 现在命令层直接收 (int argc, sds *argv)，不再需要这个薄包装——
+// 它只是一次栈上赋值（几个时钟周期，相对 ~107µs/命令可忽略），
+// 反而让"谁拥有 argv、哪些槽已被转移"的所有权语义更绕。
 
 // 供第三层直接调用的辅助函数
 int parse_multibulk_header(const char *p, const char **next, int *argc);

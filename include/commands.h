@@ -1,13 +1,20 @@
 #ifndef COMMANDS_H
 #define COMMANDS_H
 
-#include "protocol.h"   // Command 类型
+#include "protocol.h"   // 解析要用到的辅助函数声明
 #include "storage.h"    // Storage 类型
 #include "zset.h"       // ZSet 类型
 #include "server.h"     // send_response 声明（因为 commands.c 要用）
 
 // 返回值：1 = 正常响应完成；-1 = 应断开连接（如 OOM：错误已发出，继续响应不安全，B8 修复）
-int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset);
+//
+// 参数说明（argc, argv）：
+//   argv 是解析器（server.c processMultibulkBuffer / processInlineCommand）创建的
+//   sds 数组，所有权归调用方；命令层只读使用。唯一例外是 SET 分支的
+//   "steal 所有权"优化：把 key/value 两格的 sds 直接移交给哈希表，并把这
+//   两格 argv[i] 置 NULL（server.c 的 sdsfree(NULL) 是安全 no-op），因此调用方
+//   循环释放不 double-free、哈希表不泄漏。其余命令的 argv 一律归调用方释放。
+int handle_command(int client_fd, int argc, sds *argv, Storage *store, ZSet *zset);
 
 /* ============================================================
  * 响应发送：为什么"分段直发"、为什么这里不需要输出缓冲
