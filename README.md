@@ -399,6 +399,19 @@ SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层�
 
 > **一句话**：省几次系统调用（malloc/free）对实际效率帮助很小——真正贵的是那些大 memcpy。`Command` 薄包装（栈上几次赋值）纯为接口整洁，收益≈0；但 **steal 所有权无副作用、大值 +7%、小值不亏**，所以干脆做成了默认行为。
 
+#### 为什么 storage 原来要拷贝、steal 又怎么不悬空（所有权视角）
+
+`c->argv` 是**指针数组壳**（`malloc` 的 `sds*`），每个槽**指向**一块 `extract_bulk_content` 用 `sdsnewlen` 从 querybuf 独立 `malloc` 出来的数据 sds——两块不同的内存。命令一结束，`server.c` 就 `sdsfree(c->argv[i]) + free(c->argv)`：数组壳无条件归还，"仍归 server 所有"的数据 sds 也被释放。
+
+所以直接 `hashtable_set(s->ht, argv[1], argv[2])`（既不拷贝、也不转移）是**悬空 bug**：哈希表存的指针指向 `c->argv[1]` 指向的 sds，命令结束它就失效，下次 GET 读到已释放内存。避开它只有两条路，二选一：
+
+| | 存进哈希表的是 | 命令结束后原数据 sds 会怎样 | 结果 |
+|---|---|---|---|
+| **storage_set（旧）** | `sdsdup` 拷的新一份（与 c->argv 无关） | 原 sds 被 server 释放 | 哈希表持拷贝，安全 |
+| **storage_set_steal（现用）** | `argv[i]` 指向的原 sds 本身 | 已被接管，槽置 NULL 不再释放 | 哈希表持原件，安全 |
+
+关键纪律：**每块 sds 恰好一个 owner**。steal 是"改 owner + 把登记表那格清掉"（`argv[1]=argv[2]=NULL`，`sdsfree(NULL)` 安全 no-op），既不 double-free 也不悬空；哈希表在 duplicate-key / OOM 拒绝路径自行释放传入的 sds，同样闭环。ASAN + LeakSanitizer 全路径零泄漏即证。
+
 ---
 
 ## 📈 历史性能数据
