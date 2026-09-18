@@ -24,7 +24,10 @@ ZSet *zset_create(void) {
 // 添加元素（member 为命令层传来的 sds，"所有权转移"路径）
 // ★ 存储边界：本层不再 sdsdup 深拷贝，直接把 member 的 sds 所有权移交给跳表
 //   （skiplist_add 直接接管，失败/同分路径自行 sdsfree）。调用方（commands 层
-//   ZADD 分支）必须把自己手里对应的 argv[i] 置 NULL，避免 server.c 误 free。
+//   ZADD 分支）必须把自己手里对应的 argv[i] 置 NULL，避免 server.c 误 free；
+//   置 NULL 后 server.c 的无脑释放循环因 sdsfree 内部 `if(!s) return;` 判空
+//   而安全跳过该槽，【无需】再给 server.c 加判空——关键是"每次 steal 都成对
+//   置 NULL"这条硬契约。
 void zset_add(ZSet *zset, sds member, double score) {
     if (!zset || !member) return;
     skiplist_add(zset->sl, member, score);   // 所有权移交跳表（不再拷贝）

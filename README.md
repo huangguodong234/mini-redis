@@ -138,7 +138,7 @@ flowchart TD
     C --> D{"命令分支"}
 
     D -- "SET" --> S1["storage_set_steal（默认）<br/>key/value 的 sds 所有权<b>直接移交</b>哈希表<br/>两格 argv 置 NULL，省两次 sdsdup+两次 sdsfree"]
-    D -- "GET" --> G1["storage_get 返回<b>借用</b> sds<br/>(内部指针,调用方不可 free)"]
+    D -- "GET" --> G1["storage_get 返回<b>可拥有深拷贝</b><br/>sdsdup 快照（与哈希表无关）<br/>调用方 sdsfree"]
     D -- "ZADD" --> Z1["zset_add steal<br/>member 所有权<b>直接移交</b>跳表<br/><code>argv[3] 置 NULL</code>"]
     D -- "ZRANGE" --> Z2["zset_range 深拷贝<br/>逐个 sdsdup → 可拥有数组<br/>调用方逐个 free"]
     D -- "PING/ZREM/DEL" --> O1["直接应答或整数结果"]
@@ -165,7 +165,7 @@ flowchart TD
 | 哈希表 key/value | 存入即归哈希表 | `hashtable_free` / `hashtable_del` |
 | 跳表 member | 存入即归跳表 | `skiplist_free` / `skiplist_del` |
 | `zset_range` 返回数组 | 调用方使用完毕后 | 命令层逐个 `sdsfree` + `free` |
-| `storage_get` 返回值 | 借用（只读） | **不要** free |
+| `storage_get` 返回值 | 可拥有深拷贝（与哈希表无关的快照） | 命令层 `sdsfree` |
 
 ## 🧵 SDS：简单动态字符串
 

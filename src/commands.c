@@ -192,6 +192,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
         }
         sds val= storage_get(store,argv[1]);
         send_bulk_string(client_fd, val);   // val==NULL → $-1\r\n；否则按 sdslen 二进制安全发送
+        sdsfree(val);                       // 方案C：val 是 storage_get 返回的可拥有深拷贝，用完即释放
         return 1;
     }
 

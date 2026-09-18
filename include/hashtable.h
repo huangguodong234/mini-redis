@@ -194,6 +194,8 @@ void hashtable_set(HashTable *ht,sds key,sds value);
 
 //查找 key，返回内部 value 指针（sds，本质 char*，外部不要 free；找不到返回 NULL）-GET命令
 // key 为查询用 sds，只读不接管
+// ⚠ 返回的是哈希表内部活引用（借用）：调用方不得 free，且其有效性依赖"调用期间
+//   表不被改"。storage 层的 storage_get 会在此基础上 sdsdup 成可拥有快照再外传。
 char *hashtable_get(HashTable *ht,sds key);
 
 // 删除 key，返回 1 成功，0 不存在-DEL命令（key 只读不接管）
