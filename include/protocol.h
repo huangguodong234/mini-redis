@@ -4,10 +4,17 @@
 
 #include "sds.h"       // 解析出的参数用 sds 存
 
-// 注：早期版本用 Command{int argc; sds *argv;} 结构体把参数打包传给命令层。
-// 现在命令层直接收 (int argc, sds *argv)，不再需要这个薄包装——
-// 它只是一次栈上赋值（几个时钟周期，相对 ~107µs/命令可忽略），
-// 反而让"谁拥有 argv、哪些槽已被转移"的所有权语义更绕。
+// Command：把"参数个数 + 参数数组"打包成一个小结构体传给命令层。
+// 它只是 server.c 把 c->argc / c->argv 提交给 handle_command 时的薄包装
+// （一次栈上赋值，几个时钟周期，相对 ~107µs/命令可忽略）。
+// 注意：Command 是"借视图"不是"所有权容器"——cmd.argv 指向解析器创建的
+// sds 数组，所有权仍归调用方（server.c）；命令层只读使用。唯一例外是
+// SET 分支的 steal 优化：用后把 cmd->argv[1]/cmd->argv[2] 置 NULL
+// （即把原数组那两格置 NULL），调用方循环释放空槽是安全 no-op、不 double-free。
+typedef struct {
+    int argc;      // 参数个数（含命令名本身，如 "SET" 3 个参数）
+    sds *argv;     // 参数数组，指向解析器创建的 sds 数组（借视图）
+} Command;
 
 // 供第三层直接调用的辅助函数
 int parse_multibulk_header(const char *p, const char **next, int *argc);

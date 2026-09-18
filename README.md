@@ -133,7 +133,7 @@ flowchart TD
     L3a --> P["每个参数提取为 <b>sds</b><br/><code>argv[]</code>（sds* 数组，归 Client）<br/>内容只读引用 querybuf，<b>不拷贝</b>（借用手工提取）"]
     L3b --> P
 
-    P --> C["<b>handle_command</b>（命令层）<br/><code>(fd, argc, argv[])</code><br/>直接收 argc + sds* argv，不再包 Command 结构体"]
+    P --> C["<b>handle_command</b>（命令层）<br/><code>(fd, Command* cmd)</code><br/>Command 薄包装打包 argc + argv[]（借视图）"]
 
     C --> D{"命令分支"}
 
@@ -376,14 +376,14 @@ SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层�
 
 ---
 
-### 10. 「argv 不释放给哈希」优化（已是默认行为）
+### 10. 「argv 不释放给哈希」优化（steal 为默认行为）
 
-> 你问：每 SET 完，`server.c` 把解析出的 argv sds 全 `sdsfree` 掉了；能不能**不释放、直接把这些 sds 的所有权移交给哈希表**，省掉 storage 里 `sdsdup` 深拷贝 + 之后 `sdsfree` 的那几次分配/释放？当时还想顺便**删掉 `Command{int argc; sds *argv;}` 结构体**，直接传 `(argc, argv)` 少一次指针转换。
+> 你问：每 SET 完，`server.c` 把解析出的 argv sds 全 `sdsfree` 掉了；能不能**不释放、直接把这些 sds 的所有权移交给哈希表**，省掉 storage 里 `sdsdup` 深拷贝 + 之后 `sdsfree` 的那几次分配/释放？
 >
-> 两个都做了，而且优先改了更值钱的那个：
+> 两件事的最终形态：
 >
-> 1. **`Command` 结构体已删除**——`handle_command` 现在直接收 `(int fd, int argc, sds *argv, ...)`。这一步本身收益≈0（那只是栈上两次赋值，几个时钟周期；相对每命令 ~107µs 的 RTT 可忽略），纯粹是接口变简洁、所有权语义更直白。
-> 2. **steal 所有权已是默认行为**（不再是编译开关）——SET 分支恒走 `storage_set_steal()`：把 key/value 两格 sds 的所有权直接交给哈希表，并把这俩 `argv[i]` 置 `NULL`。`server.c` 的释放循环对 `NULL` 是安全 no-op，不 double-free；哈希表在 duplicate-key（`sdsfree(key)`）、OOM 拒绝（`sdsfree(key)+sdsfree(value)`）等路径都**自行释放传入的 sds**，故不泄漏。**40/40 回归测试通过**，覆盖写、二进制 `\0`、DEL 后重写都无泄漏/无崩溃。
+> 1. **steal 所有权是默认行为**（不再是编译开关）——SET 分支恒走 `storage_set_steal()`：把 key/value 两格 sds 的所有权直接交给哈希表，并把这俩 `argv[i]` 置 `NULL`。`server.c` 的释放循环对 `NULL` 是安全 no-op，不 double-free；哈希表在 duplicate-key（`sdsfree(key)`）、OOM 拒绝（`sdsfree(key)+sdsfree(value)`）等路径都**自行释放传入的 sds**，故不泄漏。**40/40 回归测试通过**，覆盖写、二进制 `\0`、DEL 后重写都无泄漏/无崩溃。
+> 2. **`Command{int argc; sds *argv;}` 结构体保留**（作为薄包装）——`handle_command` 收 `(int fd, Command *cmd, ...)`，server.c 把 `c->argc/c->argv` 打成一个局部 `Command` 提交。它只是"借视图"（`cmd.argv` 指向解析器建的数组，所有权仍归调用方），不是所有权容器；SET steal 时置 `cmd->argv[i] = NULL` 即作用于原数组本身。这个包装收益≈0（栈上两次赋值，几个时钟周期），纯为接口整洁保留。
 >
 > **真正的收益**来自省掉两次 `sdsdup`（malloc+memcpy）和两次 `sdsfree`。此前用**交错 A/B**（同一脚本轮换两个二进制、各 8/5/5 轮取中位数）实测：
 
@@ -397,7 +397,7 @@ SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层�
 {"title":"argv 不释放优化 · 大值才划算","gap":12,"items":[{"type":"chart","kind":"line","series":[{"label":"steal 提升 %","data":[{"label":"8B","value":1.8},{"label":"32KB","value":7.2},{"label":"128KB","value":7.4}]}]},{"type":"callout","tone":"info","title":"结论：小值不值，但已默认开启（零成本）","content":"省掉的其实是两次 sdsdup 的 malloc+memcpy 和两次 sdsfree。8B 小值这两次拷贝 ~几十 ns，相比单命令 ~107µs 的固定开销可忽略，收益 0；但 32KB/128KB 大值省掉的是两次大 memcpy，砍掉 ~7% 的 SET 耗时。因为小值也不付出额外代价（无副作用、无泄漏、已 40/40 测试），所以直接把它设成了默认路径，省得再纠结编译开关。"}]}
 ```
 
-> **一句话**：省几次系统调用（malloc/free）对实际效率帮助很小——真正贵的是那些大 memcpy。去掉 `Command` 结构体收益≈0；但 **steal 所有权无副作用、大值 +7%、小值不亏**，所以干脆做成了默认行为。
+> **一句话**：省几次系统调用（malloc/free）对实际效率帮助很小——真正贵的是那些大 memcpy。`Command` 薄包装（栈上几次赋值）纯为接口整洁，收益≈0；但 **steal 所有权无副作用、大值 +7%、小值不亏**，所以干脆做成了默认行为。
 
 ---
 
@@ -474,7 +474,7 @@ SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层�
 - 重构压测章节为「四把尺子」（正确性 / 吞吐 / 大数据吞吐 / 延迟），并新增「使用场景决策」：**纯文本小 KV 极致压 QPS 用无 SDS；含 `\0` 二进制、值 ≥1KB、或要生产级健壮性一律用 SDS**
 - 新增综合压测 `bench/bench_extreme.py`（极限吞吐 + 串行延迟 + 跳表 zset，支持 3 版二进制对比）与交错 A/B `bench/bench_ab.py`（轮换取中位数、抗机器漂移）。实测：**无 SDS 小命令吞吐 ~2.5-3x（SET 159k / GET 179k vs SDS ~57k）**；延迟三版都在 ~100-130µs 量级
 - 跳表区别（详阅「跳表 vs 哈希表」小节）：发现 `skiplist_find` 是 **O(n) 线性扫**，ZADD 每次先 O(n) 查重再插，故 ZADD 吞吐（SDS ~16k）明显低于 ZSCORE（~59k）、更低于哈希 GET。升级方向：改成真 O(log n) 多层跳查
-- 「argv 不释放给哈希」优化：**删除 `Command` 结构体**（`handle_command` 直接收 `(argc, argv)`）+ **steal 所有权改为默认行为**（`storage_set_steal`，不再用 `-DSTEAL_ARGV` 开关）。交错 A/B 实测 **8B 小值 +1.8%（噪声内）；32KB/128KB 大值 +7%**，40/40 测试过、无泄漏。删结构体收益≈0，steal 无副作用所以默认开启（详阅「argv 不释放给哈希」小节）
+- 「argv 不释放给哈希」优化：**steal 所有权改为默认行为**（`storage_set_steal`，不再用 `-DSTEAL_ARGV` 开关）；`Command{argc, argv}` 薄包装保留（`handle_command` 收 `(fd, Command*)`）。交错 A/B 实测 **8B 小值 +1.8%（噪声内）；32KB/128KB 大值 +7%**，40/40 测试过、无泄漏。薄包装收益≈0 纯为接口整洁，steal 无副作用所以默认开启（详阅「argv 不释放给哈希」小节）
 
 **阶段 3：有序集合（6.13 - 6.25）**
 

@@ -29,8 +29,11 @@ static int parse_strict_long(const char *s, long *out) {
 // 说明：本层只负责“调命令 + 调 RESP 辅助函数拼接/发送响应”，
 //       所有拼接细节（snprintf、按长度发二进制数据）都封装在 server.c 的
 //       send_* 辅助函数里，命令层不直接碰 send_response。
-int handle_command(int client_fd,int argc,sds *argv,Storage *store,ZSet *zset)  //(文件描述符，参数个数，参数数组，存储引擎，跳表)
+int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(文件描述符，命令包装，存储引擎，跳表)
 {
+    int argc = cmd->argc;   // 参数个数
+    sds *argv = cmd->argv;  // 参数数组（借视图，指向解析器创建的 sds 数组）
+
     //空命令
     if (argc<1){
         send_error(client_fd, "ERR no command");
