@@ -165,7 +165,17 @@ int handle_command(int client_fd,Command *cmd,Storage *store,ZSet *zset)  //(文
             send_error(client_fd, "ERR wrong number of arguments for 'SET'");
             return 1;
         }
+        // SET 分支：默认走“深拷贝”路径 storage_set。
+        // 编译期开关 STEAL_ARGV 开启“argv 不释放给哈希”优化：
+        //   直接把解析出的 key/value 所有权移交哈希表（省两次 sdsdup + 两次
+        //   sdsfree），命令层把被接管的两格 argv 置 NULL，server.c 释放循环跳过。
+#ifdef STEAL_ARGV
+        storage_set_steal(store, cmd->argv[1], cmd->argv[2]);
+        cmd->argv[1] = NULL;   // 已被哈希表接管，server.c 不得再 free
+        cmd->argv[2] = NULL;
+#else
         storage_set(store,cmd->argv[1],cmd->argv[2]);
+#endif
         send_simple_string(client_fd, "OK");   // 惯例大写（redis-cli 会原样显示）
         return 1;
     }

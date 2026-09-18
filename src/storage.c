@@ -54,6 +54,18 @@ void storage_set(Storage *s, sds key, sds value) {
     hashtable_set(s->ht,k,v);
 }
 
+// SET 命令的“所有权转移”路径（argv 不释放给哈希）
+// ★ 与 storage_set 的区别：这里不 sdsdup 深拷贝，而是直接把调用方解析出的
+//   key/value sds 的所有权移交给哈希表（省掉每 SET 两次 sdsdup 的 malloc+
+//   memcpy，也省掉 server 层后续对这两个元素的两次 sdsfree）。
+//   ⚠ 调用方（commands 层）必须把自己手里对应的 argv[i] 置 NULL，
+//   避免 server.c 误 free（哈希表现在拥有它们）。
+void storage_set_steal(Storage *s, sds key, sds value) {
+    if(!s || !key || !value) return;
+    // 所有权直接移交，不再拷贝；hashtable_set 会负责持有，重复 key 时自释放
+    hashtable_set(s->ht, key, value);
+}
+
 // GET 命令的实现（key 只读不接管；返回内部 value 的 sds，调用方不要 free）
 sds storage_get(Storage *s, sds key) {
     if(!s || !key) return NULL;
