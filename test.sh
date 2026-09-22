@@ -19,7 +19,7 @@ set -u                      # 未定义变量报错（set -e 不用，避免个�
 # ============ 配置（环境变量可覆盖） ============
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-6379}"
-LOG_FILE="/tmp/mini-redis-server-${PORT}.log"   # 每端口独立日志，避免并发脚本互相覆盖
+LOG_FILE="/tmp/mini-redis-server-${PORT}-${UID:-$(id -u)}.log"   # 加 UID，避免与别的用户/进程的同名日志撞上 → 触发 Permission denied
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-5}"         # 等待服务器就绪的最长秒数
 
 # ============ 统计 ============
@@ -72,6 +72,13 @@ rcli() {
 
 # ============ 服务器生命周期 ============
 start_server() {
+    # 兜底：清掉上一次测试残留的 mini-redis（端口冲突会让本次 bind 直接失败）。
+    # -x 精确匹配进程名（不会误伤 redis-server）；-u 限定为当前用户（非 root
+    # 也只能 signal 自己的进程，加 -u 让这层意图显式，避免 silent 失败）。
+    # pkill 没匹配到时返回 1，但 ; sleep 0.3 保证继续；SO_REUSEADDR 已设，
+    # 这里 sleep 只是给 TIME_WAIT 一个短暂的兜底。
+    pkill -x -u "${UID:-$(id -u)}" mini-redis 2>/dev/null; sleep 0.3
+
     if [ "${SKIP_BUILD:-0}" != "1" ]; then
         echo "==> 编译..."
         if ! make >/dev/null 2>&1; then
@@ -88,7 +95,11 @@ start_server() {
     echo "==> 启动服务器 ${HOST}:${PORT} ..."
     ./mini-redis >"$LOG_FILE" 2>&1 &
     SERVER_PID=$!
-    trap "kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null" EXIT
+    # 兜底关停：只 kill 不 wait。wait 的退出状态可能被 bash 当作脚本最终退出码，
+    # 在某些场景下把"测试失败应该是 1"变成 2（也可能在 trap 里与已 reaped 的 PID
+    # 返回 127）。trap 的唯一目的是关停进程，不该影响脚本语义。
+    # 末尾用 "|| true" 强制 trap 整体返回 0，避免任何意外覆盖显式 exit N。
+    trap "kill $SERVER_PID 2>/dev/null || true" EXIT
 
     # 用 PING 轮询等待就绪（而非固定 sleep），最多等 STARTUP_TIMEOUT 秒
     local waited=0
@@ -184,6 +195,38 @@ R=$(rcli ZADD myzset 20 apple 2>/dev/null)
 assert_eq "ZSCORE banana" "5" "$(rcli ZSCORE myzset banana 2>/dev/null)"
 assert_eq "ZSCORE apple" "20" "$(rcli ZSCORE myzset apple 2>/dev/null)"
 assert_empty "ZSCORE miss" "$(rcli ZSCORE myzset cherry 2>/dev/null)"
+
+# ---- 分数格式化回归（对齐真实 Redis d2string 的最短往返表示）----
+# 回归点：曾用 "%.17g" 导致常见值出现浮点噪声（0.1 → 0.10000000000000001）。
+# 期望值直接取自真实 Redis 的 ZSCORE 输出。
+#
+# ⚠ 注意：本项目 zset 的 key 参数当前被忽略（commands.c 里 `(void)key`），
+#   所有 ZADD/ZRANGE/ZSCORE 共享同一个全局 zset（README 已列为已知限制）。
+#   因此这里必须复用 myzset 这一把"全局表"，不能另开 key 名——
+#   否则会污染后续 ZRANGE myzset 的次序断言。
+rcli ZADD myzset 0.1  s01 >/dev/null 2>&1
+assert_eq "ZSCORE 0.1 不带浮点噪声" "0.1" "$(rcli --raw ZSCORE myzset s01 2>/dev/null)"
+rcli ZADD myzset 0.3  s03 >/dev/null 2>&1
+assert_eq "ZSCORE 0.3 不带浮点噪声" "0.3" "$(rcli --raw ZSCORE myzset s03 2>/dev/null)"
+rcli ZADD myzset 1e-7 s07 >/dev/null 2>&1
+assert_eq "ZSCORE 1e-7 用指数形式" "1e-07" "$(rcli --raw ZSCORE myzset s07 2>/dev/null)"
+rcli ZADD myzset 3.0  s30 >/dev/null 2>&1
+assert_eq "ZSCORE 3.0 去掉多余小数" "3" "$(rcli --raw ZSCORE myzset s30 2>/dev/null)"
+rcli ZADD myzset 1e10 s10 >/dev/null 2>&1
+assert_eq "ZSCORE 1e10 不用指数(Redis 风格)" "10000000000" "$(rcli --raw ZSCORE myzset s10 2>/dev/null)"
+rcli ZADD myzset -0   snz >/dev/null 2>&1
+assert_eq "ZSCORE -0 保留负零" "-0" "$(rcli --raw ZSCORE myzset snz 2>/dev/null)"
+rcli ZADD myzset inf  sinf >/dev/null 2>&1
+assert_eq "ZSCORE inf 拼写固定" "inf" "$(rcli --raw ZSCORE myzset sinf 2>/dev/null)"
+rcli ZADD myzset -inf sninf >/dev/null 2>&1
+assert_eq "ZSCORE -inf 拼写固定" "-inf" "$(rcli --raw ZSCORE myzset sninf 2>/dev/null)"
+# 关键：不得为了"好看"而丢失精度 —— 这个值必须原样保留 17 位
+rcli ZADD myzset 0.30000000000000004 sprec >/dev/null 2>&1
+assert_eq "ZSCORE 保留必要精度(0.1+0.2)" "0.30000000000000004" "$(rcli --raw ZSCORE myzset sprec 2>/dev/null)"
+# 清掉本组新增成员，避免影响后续 ZRANGE myzset 的次序断言
+for m in s01 s03 s07 s30 s10 snz sinf sninf sprec; do
+    rcli ZREM myzset "$m" >/dev/null 2>&1
+done
 
 R=$(rcli ZRANGE myzset 0 -1 2>/dev/null)
 { printf '%s' "$R" | grep -q "banana" && printf '%s' "$R" | grep -q "apple"; } \
@@ -326,6 +369,98 @@ expect=lambda: b"+OK\r\n$327680\r\n"+b"z"*327680+b"\r\n"'
 rcli DEL bigkey1 >/dev/null 2>&1
 rcli DEL bigkey2 >/dev/null 2>&1
 rcli DEL bigkey3 >/dev/null 2>&1
+echo ""
+
+# ---------- 8. 断连 / 并发 / 优雅退出（审查修复回归） ----------
+echo "--- 8. 断连 / 并发 / 优雅退出 ---"
+
+# 8.1 SIGPIPE 回归（P0-1）：客户端发完命令立刻强制 RST 关闭，一个回复字节都不读。
+#     修复前：服务器随后的 write() 会收到 SIGPIPE，默认动作是【终止整个进程】——
+#             一个客户端就能把服务搞挂。修复后：只拿到 EPIPE，继续服务下一个客户端。
+py_rst_probe() {
+    HOST="$HOST" PORT="$PORT" python3 - <<'PYEOF'
+import os, socket, struct, sys
+HOST, PORT = os.environ['HOST'], int(os.environ['PORT'])
+try:
+    # 写一个大值，让服务器回包需要多次 write()，放大触发概率
+    s = socket.create_connection((HOST, PORT), timeout=3)
+    s.sendall(b"*3\r\n$3\r\nSET\r\n$7\r\nrst_key\r\n$100000\r\n" + b"z" * 100000 + b"\r\n")
+    # SO_LINGER(1,0)：close() 立即发 RST，且本端不读任何回复
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+    s.close()
+    # 服务器若已被 SIGPIPE 杀死，下面这次连接会直接失败
+    t = socket.create_connection((HOST, PORT), timeout=3)
+    t.sendall(b"*1\r\n$4\r\nPING\r\n")
+    t.settimeout(2)
+    data = t.recv(64)
+    t.close()
+    sys.stdout.write("OK" if b"PONG" in data else "NO_PONG")
+except Exception as e:
+    sys.stdout.write("DIED(%s)" % e.__class__.__name__)
+PYEOF
+}
+assert_eq "客户端 RST 断连后服务器仍存活 (SIGPIPE 回归)" "OK" "$(py_rst_probe)"
+rcli DEL rst_key >/dev/null 2>&1
+
+# 8.2 并发能力（已知限制，只记录不计分）
+#     当前是阻塞式单连接串行：第 1 条连接不关，第 2 条就得不到响应。
+#     第 4 步引入 epoll 后，应把这里改成断言"第 2 条连接也能立刻收到 PONG"。
+py_concurrency_probe() {
+    HOST="$HOST" PORT="$PORT" python3 - <<'PYEOF'
+import os, socket
+HOST, PORT = os.environ['HOST'], int(os.environ['PORT'])
+try:
+    a = socket.create_connection((HOST, PORT), timeout=2)   # 第 1 条：建立后保持打开
+    b = socket.create_connection((HOST, PORT), timeout=2)   # 第 2 条：立刻发 PING
+    b.sendall(b"*1\r\n$4\r\nPING\r\n")
+    b.settimeout(1.5)
+    try:
+        d = b.recv(64)
+        out = "第 2 条连接立即收到回复（并发可用）" if b"PONG" in d else "第 2 条连接无回复"
+    except socket.timeout:
+        out = "第 2 条连接 1.5s 内无回复（被第 1 条阻塞）"
+    b.close()
+    a.close()
+except Exception as e:
+    out = "探测失败(%s)" % e.__class__.__name__
+print(out)
+PYEOF
+}
+echo "  [NOTE] 并发能力：$(py_concurrency_probe)"
+echo "         当前为阻塞式单连接串行，属已知限制；epoll 改造后应改为断言「第 2 条也能收到 PONG」"
+echo ""
+
+# 8.3 优雅退出回归（P0-2）：有客户端连接着时发 SIGINT，服务器必须能退出。
+#     修复前：readQueryFromClient 的 EINTR 分支无条件 continue，
+#             只要还有客户端连着，Ctrl+C 就永远退不出去（只能等客户端断开）。
+#     ⚠ 这一项会终止服务器，必须放在所有需要服务器的用例之后。
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    _record 0 "有客户端连接时 SIGINT 能优雅退出" "服务器进程已不在，前置用例可能已把它搞挂"
+else
+    python3 - "$HOST" "$PORT" <<'PYEOF' &
+import sys, socket, time
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=10)
+time.sleep(8)      # 保持连接不放，期间外部给服务器发 SIGINT
+s.close()
+PYEOF
+    HOLD_PID=$!
+    sleep 0.5
+    kill -INT "$SERVER_PID" 2>/dev/null
+    waited=0
+    while kill -0 "$SERVER_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+        _record 0 "有客户端连接时 SIGINT 能优雅退出" "进程 $SERVER_PID 在 5s 内未退出"
+        kill -9 "$SERVER_PID" 2>/dev/null
+    else
+        _record 1 "有客户端连接时 SIGINT 能优雅退出"
+    fi
+    # 保持连接的那个 python 还停在 sleep 里，直接结束掉，别让整个套件白等好几秒
+    kill "$HOLD_PID" 2>/dev/null
+    wait "$HOLD_PID" 2>/dev/null
+fi
 echo ""
 
 # ---------- 最终结果统计 ----------

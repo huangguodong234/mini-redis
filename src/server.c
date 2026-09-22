@@ -97,14 +97,23 @@ void free_client(Client *c) {
 // 发送 len 字节给客户端（底层唯一执行 write() 循环的发送函数）
 // 循环 write，处理部分写入和 EINTR（信号打断），保证整条响应发完，RESP 协议不截断
 // data 按明确字节长度发送，二进制安全（内容可含 '\0'）
+// ⚠ 前提：main 已把 SIGPIPE 设为 SIG_IGN（P0-1）。否则向已收到 RST 的连接写入时，
+//   SIGPIPE 的默认动作会直接终止进程，本函数下面的错误分支根本没有机会执行。
 void send_response(int client_fd, const void *data, size_t len){
     if(!data || len == 0) return;
     const char *p = data;
     while (len > 0) {
         ssize_t n = write(client_fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;      // 被信号打断，重试
-            break;                             // 其余写错误（如对端关闭），放弃本次
+        // 关于 n == 0 的说明（更正此前过度的说法）：
+        //   在本项目的场景下 write() 返回 0 实际【不可达】—— 发送缓冲区满时，
+        //   阻塞 socket 会在这里阻塞等待，非阻塞 socket 则返回 -1/EAGAIN；
+        //   按 POSIX，count > 0 的成功返回是"实际写入的字节数"，不会是 0。
+        //   所以下面这个分支是【防御性写法】，不是在修一个可复现的 bug。
+        //   仍然保留它，是因为万一真遇到 0，两种处理代价极不对称：
+        //   continue 会变成 100% CPU 的空转死循环，break 只是放弃本次响应。
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;   // 被信号打断，重试
+            break;   // n == 0（防御）或写错误（对端关闭 / EPIPE），放弃本次
         }
         p += n;
         len -= (size_t)n;
@@ -251,12 +260,24 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
     int nread = 0;   // 初始化：若首轮循环直接跳出，nread 也不可未定义
     char rbuf[4096]; // 临时读缓冲；读到的数据用 sdscatlen 追加到 sds，可任意拼接
     // 2. 循环读取数据（读入临时缓冲，再追加到 sds——不再受固定大小限制）
-    while(1){
+    //    P0-2 修复：循环条件带上退出标志。这一处是必要的——若 SIGINT 恰好在我们
+    //    "正在处理命令"的期间投递并被消费掉（此时并不阻塞在 read 上，拿不到
+    //    EINTR），之后回到这里再阻塞进 read() 就永远等不到第二次 EINTR 了。
+    //    放在循环头检查，每处理完一轮就重新确认一次退出意图。
+    //    ⚠ 关键：这个判断只会落在"本轮 processInputBuffer 已经把缓冲区排空之后"，
+    //    所以它不会丢掉任何已经收下的命令；丢命令的风险来自在解析循环内部
+    //    判标志，那种写法已经移除（见 processInputBuffer 的说明）。
+    while(Keep_running){
         nread=read(c->fd, rbuf, sizeof(rbuf));
         if(nread<0){
             // B7 修复：被信号打断（SIGINT/调试器 attach 等）nread<0,不是客户端断开，
             // 继续读即可；真正的读错误才退出
             if(errno==EINTR){
+                // P0-2 修复：原先这里无条件 continue，Ctrl+C 置位 Keep_running 之后
+                // 仍会重新阻塞在 read()，于是只要有任意一个客户端连着（哪怕完全
+                // 空闲），服务器就永远退不出去。现在被打断时先看退出标志，
+                // 已置位则跳出循环，交回 main 收尾释放资源。
+                if(!Keep_running) break;
                 continue;
             }
             break;   // 出错
@@ -287,7 +308,9 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
 
     if (nread==0){
        printf("客户端断开\n"); 
-    }else if(nread<0){
+    }else if(nread<0 && errno != EINTR){
+        // 收到 SIGINT 时我们是从 EINTR 分支主动跳出的，不是读错误，
+        // 不该打印 "Interrupted system call" 这种误导信息。
         perror("read");
     }
 
@@ -310,6 +333,12 @@ void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
  */
 int processInputBuffer(Client *c,Storage *store, ZSet *zset){
     // 循环解析：只要游标后面还有数据，就尝试解析命令（处理粘包）
+    // 这里【不】检查 Keep_running —— 本函数的契约是"把缓冲区里所有完整命令一次
+    // 处理完"，中途因退出标志跳出会留下"处理了一半"的状态：虽然 sdsrange 会把
+    // 未处理数据保留在缓冲区里、随后由 free_client 统一释放（不是内存错误），
+    // 但客户端已经发来的命令会被无谓丢弃，而且让解析层多背了一个"感知关停"的
+    // 职责。退出意图统一由调用方 readQueryFromClient 的读循环负责判断，
+    // 那里只会在本函数返回（缓冲区已排空）之后才生效，因此不会丢命令。
     while((size_t)c->qb_pos < sdslen(c->querybuf)){
         // 按解析状态分流（不能只看首字节！）：
         //   1) multibulklen > 0 说明一条 RESP 命令正跨多次 read 解析中（上次的半包），

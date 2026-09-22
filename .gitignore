@@ -1,7 +1,12 @@
 # 编译产物
 *.o
+*.d
 server
 mini-redis
+tests/test_sds
+tests/test_hashtable
+tests/test_skiplist
+tests/test_zset
 test_skiplist
 test_zset
 test_hash

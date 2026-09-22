@@ -28,7 +28,13 @@ Storage *storage_init();
 //       server.c 的核心释放会对它 double-free。故"每次 steal 都必须成对置 NULL"
 //       是本方案的硬性契约，而不是靠释放循环判空兜底。
 //   哈希表在 duplicate-key / OOM 路径自行释放传入的 sds，故不泄漏。
-void storage_set_steal(Storage *s, sds key, sds value);
+//
+// ★ 返回：1 = 成功写入；0 = 失败（OOM，本次没有写入）。
+// ★ 所有权契约（P0-4 修复）：无论返回 1 还是 0，key 与 value 的所有权都在
+//   返回时转移完毕（成功 → 哈希表持有；失败 → 已被释放）。调用方一律置 NULL，
+//   "每次 steal 必须成对置 NULL"这条硬契约在失败路径下同样成立。
+//   原先返回 void 是"OOM 静默丢数据却仍回 +OK"的根因，故必须可判定成败。
+int storage_set_steal(Storage *s, sds key, sds value);
 
 // 获取键对应的值，不存在返回 NULL  -GET命令（读和查数据）
 // ★ 快照拷贝路径：key 为 sds 只读不接管；返回【可拥有的深拷贝】（与哈希表无关

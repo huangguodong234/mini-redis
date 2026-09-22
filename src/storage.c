@@ -48,10 +48,16 @@ Storage *storage_init() {
 //   无脑释放循环因 sdsfree 内部 `if(!s) return;` 判空而安全跳过该槽，
 //   【无需】再给 server.c 加判空；哈希表在 duplicate-key / OOM 拒绝路径
 //   自行释放传入的 sds，故不泄漏。
-void storage_set_steal(Storage *s, sds key, sds value) {
-    if(!s || !key || !value) return;
+int storage_set_steal(Storage *s, sds key, sds value) {
+    // 无法入库的路径也要就地归还，保证"无论成败所有权都已转移"这条契约成立，
+    // 调用方（commands 层）才能无条件把 argv 槽置 NULL 而不泄漏。
+    if(!s || !key || !value){
+        sdsfree(key);
+        sdsfree(value);
+        return 0;
+    }
     // 所有权直接移交，不再拷贝；hashtable_set 会负责持有，重复 key 时自释放
-    hashtable_set(s->ht, key, value);
+    return hashtable_set(s->ht, key, value);
 }
 
 // GET 命令的实现（key 只读不接管）

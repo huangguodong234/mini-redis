@@ -39,6 +39,19 @@ void setup_signal_handler(void){
     sigemptyset(&sa.sa_mask);        // sigemptyset()不屏蔽信号函数 
     sa.sa_flags =0;
     sigaction(SIGINT,&sa,NULL);      //将SIGINT（Ctrl+c触发终止进程）绑定到sa中
+
+    // P0-1 修复：忽略 SIGPIPE。
+    // 客户端发完命令不读回复就关闭（内核回 RST）、或用 SO_LINGER(1,0) 强制 RST 关闭时，
+    // 本进程后续的 write() 会先收到 SIGPIPE，而它的【默认动作是终止进程】——
+    // 一个客户端就能把整个服务器杀掉，而且死在 free_client 之前，所有连接状态全丢。
+    // 忽略之后 write() 只返回 -1/EPIPE，由 send_response 当作普通写错误放弃本次即可。
+    // 用 write()（无法带 MSG_NOSIGNAL）的阻塞式模型必须做这一步，Redis 同样如此。
+    struct sigaction sa_pipe;
+    memset(&sa_pipe,0,sizeof(sa_pipe));
+    sa_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&sa_pipe.sa_mask);
+    sa_pipe.sa_flags =0;
+    sigaction(SIGPIPE,&sa_pipe,NULL);
 }
 
 int main(int argc, char **argv){
@@ -57,8 +70,18 @@ int main(int argc, char **argv){
     }
 
     // 初始化存储引擎
+    // P1-5 修复：原先不检查返回值。一旦 storage_init() / zset_create() 失败返回
+    // NULL，后续所有 SET/ZADD 都会在 storage_set_steal / zset_add 的判空里被
+    // 静默丢弃，而命令层照旧回 +OK —— 全程静默失败，客户端毫不知情。
     Storage *store = storage_init();
     ZSet *global_zset = zset_create();
+    if (!store || !global_zset) {
+        fprintf(stderr, "初始化失败：%s\n",
+                store ? "有序集合(zset) 创建失败" : "存储引擎(storage) 创建失败");
+        zset_free(global_zset);    // 两者对 NULL 都是安全 no-op
+        storage_free(store);
+        return EXIT_FAILURE;
+    }
 
     // 注册信号处理
     setup_signal_handler();

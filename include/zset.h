@@ -20,7 +20,12 @@ ZSet *zset_create(void);
 //     - 若忘记置 NULL，该槽仍是原地址（已被跳表持有），server.c 会对它
 //       double-free。故"每次 steal 都必须成对置 NULL"是硬性契约。
 //   跳表在 duplicate/同分/OOM 路径自行释放传入的 sds，故不泄漏。
-void zset_add(ZSet *zset, sds member, double score);
+//
+// ★ 返回：1 = 成功（新增 / 更新分数 / 同分无变化）；0 = 失败（OOM，未写入）。
+// ★ 所有权契约（P0-4 修复）：无论返回 1 还是 0，member 的所有权都在返回时
+//   转移完毕（成功 → 跳表持有；失败 → 已被释放）。调用方一律置 NULL。
+//   原先返回 void，OOM 丢数据时命令层仍回 +OK，属静默数据丢失。
+int zset_add(ZSet *zset, sds member, double score);
 
 // 删除指定成员，成功返回1，不存在返回0-ZREM命令
 // member 为 sds，只读不接管

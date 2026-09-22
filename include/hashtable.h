@@ -190,7 +190,14 @@ HashTable *hashtable_create(int initial_capacity);
 
 //插入或更新键值对-SET命令
 // key/value 为 sds，由本表接管所有权（存储后由 hashtable_free/del 释放）
-void hashtable_set(HashTable *ht,sds key,sds value);
+// ★ 返回：1 = 成功写入；0 = 失败（OOM，本次没有写入）。
+// ★ 所有权契约（P0-4 修复）：无论返回 1 还是 0，key 与 value 的所有权都在
+//   返回时转移完毕 —— 成功归本表持有，失败则已被本函数 sdsfree。
+//   调用方一律不得再碰它们，也必须把手里对应的 argv 槽置 NULL。
+//   这样"每次 steal 必须成对置 NULL"这条硬契约在失败路径下同样成立：
+//   既不 double-free，也不泄漏。令 set 返回 void 是原先"OOM 静默丢数据
+//   却回 +OK"的根因，故必须可判定成败。
+int hashtable_set(HashTable *ht,sds key,sds value);
 
 //查找 key，返回内部 value 指针（sds，本质 char*，外部不要 free；找不到返回 NULL）-GET命令
 // key 为查询用 sds，只读不接管

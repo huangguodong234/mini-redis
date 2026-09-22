@@ -6,6 +6,13 @@
 #include "zset.h"
 #include "sds.h"
 #include <stddef.h>
+#include <signal.h>
+
+/* 全局运行标志：由 main.c 定义，SIGINT 处理函数把它置 0。
+ * 网络层（server.c）需要读它：阻塞在 read() 时被信号打断（EINTR）之后，
+ * 必须先看这个标志再决定是否继续，否则 Ctrl+C 在有客户端连接时
+ * 会永远退不出去（P0-2）。 */
+extern volatile sig_atomic_t Keep_running;
 
 // 客户端结构体：封装每个连接的状态
 typedef struct {

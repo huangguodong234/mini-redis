@@ -28,9 +28,14 @@ ZSet *zset_create(void) {
 //   置 NULL 后 server.c 的无脑释放循环因 sdsfree 内部 `if(!s) return;` 判空
 //   而安全跳过该槽，【无需】再给 server.c 加判空——关键是"每次 steal 都成对
 //   置 NULL"这条硬契约。
-void zset_add(ZSet *zset, sds member, double score) {
-    if (!zset || !member) return;
-    skiplist_add(zset->sl, member, score);   // 所有权移交跳表（不再拷贝）
+int zset_add(ZSet *zset, sds member, double score) {
+    // 无法入库时同样就地归还，维持"无论成败所有权都已转移"的契约，
+    // 调用方（commands 层）才能无条件把 argv 槽置 NULL 而不泄漏。
+    if (!zset || !member) {
+        sdsfree(member);
+        return 0;
+    }
+    return skiplist_add(zset->sl, member, score);   // 所有权移交跳表（不再拷贝）
 }
 
 // 删除成员（查询用 member 只读不接管）
