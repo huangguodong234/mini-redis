@@ -1,11 +1,16 @@
 #ifndef STORAGE_H
 #define STORAGE_H
 
-#include "hashtable.h"    //因为要用 HashTable
+#include "dict.h"         //因为要用通用 dict（key/value 都是 void*）
 
-// 动态数组存储结构变哈希表，时间复杂度从O（n）变o(1) 
+// 动态数组存储结构变哈希表，时间复杂度从O（n）变o(1)
 typedef struct {
-    HashTable *ht; // 底层存储变成哈希表
+    // ★ 通用哈希表（原 HashTable）。两者差别只在类型与所有权：
+    //   - 原 HashTable：key/value 写死为 sds，销毁写死 sdsfree（只能服务 storage）
+    //   - dict：key/value 是 void*，销毁由 d->type 决定——
+    //     所以同一份核心代码同时服务 storage（拥有）与跳表索引（借用）。
+    //   本层挂的是 sdsDictType：拥有 key/value，销毁 = sdsfree。
+    dict *ht;
 } Storage;
 
 // ★ 本层是存储边界（不再做 C 字符串 <-> sds 转换）：

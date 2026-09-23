@@ -4,114 +4,54 @@
 #include "skiplist.h"
 
 // ============================================================================
-// 一、内部哈希索引（member → SkipNode，O(1) 查找，承担 Redis dict 辅助表角色）
-//     key / node 都是【借用引用】：key 指向所属 SkipNode 的 member，node 指向
-//     所属 SkipNode。索引本身不持有、不释放这两者，生命周期完全由跳表管理，
-//     因此 skiplist_del / skiplist_free 必须「先摘索引条目，再释放节点」。
+// 一、索引的 dictType：只借用，不拥有（★ 消重的核心）
 // ============================================================================
+// 这里曾经是一整块私有哈希表（IndexNode / buckets / index_* 约 100 行）。
+// 现在整块删除，换成下面这张函数表 —— 因为通用 dict 已经
+// 把“怎么算哈希 / 怎么比较 / 怎么销毁”外包给了调用方。
+//
+// 跳表对这三件事的答案：哈希/比较用 sds 那套（member 就是 sds），
+// 销毁【什么都不做】—— key 和 value 都是借用引用：
+//   key   指向 SkipNode->member（归 SkipNode 所有）
+//   value 就是 SkipNode*（节点生命周期由跳表管）
+// 两者都不归 dict 所有——这正是「先摘索引条目，再释放节点」这条硬约束
+// 的来历：dictDelete 不会去碰 member，所以在节点释放前调它是安全的。
+//
+// ★ 这里【没有一行代码去判断“这是跳表的表”——身份就是这张表本身：
+//   dictCreate 把它存进 d->type，之后每次 dictDelete/dictRelease 自动走到这里。
 
-#define SKIPLIST_INDEX_INIT_CAP 16
-#define SKIPLIST_INDEX_LOAD_FACTOR 0.75
-
-// djb2 哈希，按 sdslen 逐字节，二进制安全
-static unsigned long index_hash_sds(const sds str){
-    unsigned long hash =5381;
-    size_t len =sdslen(str);
-    for(size_t i=0;i<len;i++){
-        hash =((hash<<5)+hash)+(unsigned char)str[i];
-    }
-    return hash;
+// ★ 为什么显式写空操作函数而不直接传 NULL：dictFreeEntry 已会判空，
+//   传 NULL 也能跑；但空函数让“这是借用、故意不释放”在代码里看得见。
+//   （对照：sdsDictType 那边传的是 dictSdsDestructor，真释放。）
+static void skipIndexKeyDestructor(void *privdata, void *key)
+{
+    (void)privdata;
+    (void)key;   // 借用：member 归 SkipNode 所有，索引不释放它
 }
 
-// 扩容并重哈希（失败则维持原样继续，正确性不变）
-static void index_resize(Skiplist *sl){
-    int new_cap=sl->index_cap *2;
-    IndexNode **nb =calloc((size_t)new_cap,sizeof(IndexNode *));
-    if(!nb) return;   // OOM：维持原桶数（链变长而已）
-
-    for(int i=0;i<sl->index_cap;i++){
-        IndexNode *cur =sl->buckets[i];
-        while(cur){
-            IndexNode *next=cur->next;
-            int idx = (int)(index_hash_sds(cur->key) % (unsigned long)new_cap);
-            cur->next =nb[idx];
-            nb[idx]=cur;
-            cur=next;
-        }
-    }
-    free(sl->buckets);
-    sl->buckets=nb;
-    sl->index_cap=new_cap;
+static void skipIndexValDestructor(void *privdata, void *val)
+{
+    (void)privdata;
+    (void)val;   // 借用：SkipNode 归跳表所有，索引不释放它
 }
 
-// 插入/更新索引：key 借用 node->member，node 借用节点指针
-static void index_insert(Skiplist *sl, sds key, SkipNode *node){
-    int idx =(int)(index_hash_sds(key) % (unsigned long)sl->index_cap);
-    for(IndexNode *cur=sl->buckets[idx];cur;cur=cur->next){
-        if(sdscmp(cur->key,key)==0){
-            cur->node =node;   // 已存在 → 更新指向
-            return;
-        }
-    }
-    // 不存在，头插
-    IndexNode *n =malloc(sizeof(IndexNode));
-    if(!n) return;   // OOM 时索引缺失:find 退化为找不到，跳表正确性不受影响
-    n->key=key;
-    n->node=node;
-    n->next=sl->buckets[idx];
-    sl->buckets[idx]=n;
-    sl->index_size++;
-
-    if((double)sl->index_size / sl->index_cap >= SKIPLIST_INDEX_LOAD_FACTOR){
-        index_resize(sl);
-    }
-}
-
-// 删除索引条目；只释放 IndexNode，不释放 key（key 是借用引用，归节点所有）
-// 返回 1 删到；0 不存在
-static int index_remove(Skiplist *sl, sds key){
-    int idx =(int)(index_hash_sds(key) % (unsigned long)sl->index_cap);
-    IndexNode *cur =sl->buckets[idx];
-    IndexNode *prev =NULL;
-    while(cur){
-        if(sdscmp(cur->key,key)==0){
-            if(prev) prev->next=cur->next;
-            else sl->buckets[idx]=cur->next;
-            free(cur);          // 只释放桶节点，key 借用不释放
-            sl->index_size--;
-            return 1;
-        }
-        prev=cur;
-        cur=cur->next;
-    }
-    return 0;
-}
-
-// 按 key 直查节点；找不到返回 NULL（O(1) 平均）
-static SkipNode *index_get(Skiplist *sl, sds key){
-    if(!sl->buckets) return NULL;
-    int idx =(int)(index_hash_sds(key) % (unsigned long)sl->index_cap);
-    for(IndexNode *cur=sl->buckets[idx];cur;cur=cur->next){
-        if(sdscmp(cur->key,key)==0) return cur->node;
-    }
-    return NULL;
-}
-
-// 释放索引全部桶节点（key 借用，不释放）
-static void index_free(Skiplist *sl){
-    if(!sl->buckets) return;
-    for(int i=0;i<sl->index_cap;i++){
-        IndexNode *cur=sl->buckets[i];
-        while(cur){
-            IndexNode *next=cur->next;
-            free(cur);
-            cur=next;
-        }
-    }
-    free(sl->buckets);
-    sl->buckets=NULL;
-    sl->index_size=0;
-}
+// 跳表索引的操作手册：与 sdsDictType 同样的 hash/compare（member 也是
+// sds，直接复用，这就是 dict.h 把它们导出和而非 static 的原因），
+// 但 destructor 换成空操作。
+//
+// ★ 注意这里【没有一行代码去“判断这是跳表的表”——
+//   身份就是这张表本身：dictCreate 把它存进 d->type，之后每次
+//   dictDelete/dictRelease 自动走到这里。这就是把“分支”数据化成
+//   “建表时选了哪份函数表”。
+static dictType skipIndexDictType = {
+    dictSdsHash,              // hashFunction   : 复用 sds 那套（djb2，二进制安全）
+    dictSdsKeyCompare,        // keyCompare     : 复用 sdscmp（相等返回 0）
+    NULL,                     // keyFromU64     : 不用（sds key）
+    NULL,                     // keyDup         : NULL = 不拷贝（member 归 SkipNode）
+    NULL,                     // valDup         : NULL = 不拷贝（指针直接存）
+    skipIndexKeyDestructor,   // keyDestructor  : ★ 借用 → 空操作
+    skipIndexValDestructor,   // valDestructor  : ★ 借用 → 空操作
+};
 
 // ============================================================================
 // 二、随机层数生成
@@ -160,17 +100,16 @@ Skiplist *skiplist_create(void){
         sl->header->lvl[i].span=0;
     }
 
-    // ★ 初始化 member→node 哈希索引
-    sl->buckets =calloc((size_t)SKIPLIST_INDEX_INIT_CAP,sizeof(IndexNode *));
-    if(!sl->buckets){
-        fprintf(stderr, "skiplist_create: malloc buckets 失败\n");
+    // ★ member→node 索引：一张通用 dict + 一份「借用语义」的 dictType。
+    //   容量/负载因子/扩容全部交给 dict 自己管，跳表不再算桶数。
+    sl->index = dictCreate(&skipIndexDictType, NULL);
+    if(!sl->index){
+        fprintf(stderr, "skiplist_create: dictCreate 失败\n");
         free(sl->header->lvl);
         free(sl->header);
         free(sl);
         return NULL;
     }
-    sl->index_size=0;
-    sl->index_cap=SKIPLIST_INDEX_INIT_CAP;
     return sl;
 }
 
@@ -179,7 +118,9 @@ Skiplist *skiplist_create(void){
 // ============================================================================
 SkipNode *skiplist_find(Skiplist *sl, sds member) {
     if(!sl || !member) return NULL;
-    return index_get(sl, member);
+    // ★ 一行。value 存的就是 SkipNode*，这里的强制转换是本项目唯一需要写的
+    //   —— void* 只能说“我不知道它是什么”，只有调用方知道。
+    return (SkipNode *)dictFind(sl->index, member);
 }
 
 // ============================================================================
@@ -271,8 +212,11 @@ int skiplist_add(Skiplist *sl,sds member,double score){
     }
     sl->size++;
 
-    // ★ 维护 member→node 哈希索引
-    index_insert(sl, new_node->member, new_node);
+    // ★ 维护 member→node 索引：直接把 SkipNode* 当 value 存进去，
+    //   零额外分配（对比旧方案若硬塞进 sds 则需 sdsnewlen 打包指针）。
+    //   失败不影响正确性：dictFind 对缺失的键返回 NULL，
+    //   等价于旧的 index_insert 在 OOM 时静默跳过（只是 find 会查不到）。
+    (void)dictAdd(sl->index, new_node->member, new_node);
     return 1;
 }
 
@@ -305,7 +249,11 @@ int skiplist_del(Skiplist *sl, sds member) {
     }
 
     // ★ 摘除索引条目（在回收节点前，key 还是借用 target 的 member）
-    index_remove(sl, member);
+    //   顺序是硬要求：dictDelete 要调 hashFunction/keyCompare，
+    //   两者都会解引用 member；若先释放节点就是读悬垂指针。
+    //   （skipIndexDictType 的 destructor 是空操作，所以这里只会释放
+    //    dictEntry 本身，不会去动 member 或 SkipNode。）
+    (void)dictDelete(sl->index, member);
 
     // 从各层链表中摘除该节点，并修正 span（Redis 同款算法）。
     // ⚠ 必须遍历【所有】层（i<sl->max_level），而不仅是节点自身的层数：
@@ -356,7 +304,7 @@ static SkipNode *skiplist_node_at_rank(Skiplist *sl, unsigned long rank){
 unsigned long skiplist_get_rank(Skiplist *sl, sds member){
     if(!sl || !member) return 0;
     // 先用 O(1) 索引拿到节点（取 score 用于排序比较），再沿 span 求排名
-    SkipNode *nd =index_get(sl, member);
+    SkipNode *nd =(SkipNode *)dictFind(sl->index, member);
     if(!nd) return 0;
     double score=nd->score;
 
@@ -429,8 +377,11 @@ sds *skiplist_range(Skiplist *sl, int start, int stop) {
 // ============================================================================
 void skiplist_free(Skiplist *sl){
     if(!sl) return;
-    // 先释放索引（key 借用，只 free 桶节点），避免之后读到已释放节点的 member
-    index_free(sl);
+    // 先释放索引（key/value 都是借用，只 free dictEntry 与桶数组），
+    // 避免之后读到已释放节点的 member。
+    // ★ dictRelease 走的是 skipIndexDictType：destructor 是空操作，
+    //   所以它只释放索引自己的内存，碰都不碰跳表节点。
+    dictRelease(sl->index);
 
     SkipNode *curr=sl->header->lvl[0].forward;
     while(curr){

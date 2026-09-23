@@ -29,10 +29,11 @@ Storage *storage_init() {
         fprintf(stderr, "storage_init: malloc Storage 失败\n");
         return NULL;
     }
-    // 创建初始容量为 16 的哈希表（容量会自动扩容）
-    s->ht = hashtable_create(16);
+    // 创建通用哈希表，挂上 sdsDictType（拥有 key/value，销毁即 sdsfree）。
+    // 容量、负载因子、扩容都在 dict 内部自管（初始 16 桶）。
+    s->ht = dictCreate(&sdsDictType, NULL);
     if(!s->ht){
-        fprintf(stderr, "storage_init: hashtable_create 失败\n");
+        fprintf(stderr, "storage_init: dictCreate 失败\n");
         free(s);
         return NULL;
     }
@@ -56,8 +57,31 @@ int storage_set_steal(Storage *s, sds key, sds value) {
         sdsfree(value);
         return 0;
     }
-    // 所有权直接移交，不再拷贝；hashtable_set 会负责持有，重复 key 时自释放
-    return hashtable_set(s->ht, key, value);
+    // ★ 所有权直接移交，不再拷贝。
+    //   这里的语义与原 hashtable_set 完全一致，只是换了实现：
+    //     - 成功：dict 持有这两个 sds，最终在 dictDelete/dictRelease 时
+    //       走 sdsDictType 的 destructor（sdsfree）释放；
+    //     - key 已存在：dictAdd 会把新 value 覆盖进去并返回 1，
+    //       旧 value 不再被引用，故需在此处主动释放（见下方补丁）；
+    //     - OOM：dictAdd 返回 0，且【不会替我们释放】key/value
+    //       （通用表不知道它们归谁），所以必须在本层就地归还。
+    //
+    // ★ 一个已有 key 的更新路径：先探一下旧 value。
+    //   为什么不能让 dict 自己去释放旧 value：因为通用表不知道
+    //   旧 value 归谁（storage 的需要 sdsfree，跳表索引的只是个 SkipNode*
+    //   不该动）——这正是“销毁权已外包”的代价：负责人变成调用方。
+    //   代价很小：一次 dictFind（O(1)），而且这个分支本来就只在“重复 SET”时走。
+    void *old = dictFind(s->ht, key);
+    if (old) sdsfree((sds)old);          // 释放旧 value（旧 key 就是新 key，不用动）
+
+    if (!dictAdd(s->ht, key, value)) {
+        // 失败：本次没写入，就地归还 key/value，
+        // 保持“无论成败所有权都已转移”这条硬契约成立。
+        sdsfree(key);
+        sdsfree(value);
+        return 0;
+    }
+    return 1;
 }
 
 // GET 命令的实现（key 只读不接管）
@@ -70,7 +94,7 @@ int storage_set_steal(Storage *s, sds key, sds value) {
 //   ⚠ 调用方负责 sdsfree 返回值（NULL 表示键不存在，无需释放）。
 sds storage_get(Storage *s, sds key) {
     if(!s || !key) return NULL;
-    char *internal = hashtable_get(s->ht,key);
+    char *internal = (char *)dictFind(s->ht, key);
     if(!internal) return NULL;
     return sdsdup((sds)internal);  // 返回可拥有的深拷贝
 }
@@ -78,12 +102,15 @@ sds storage_get(Storage *s, sds key) {
 // DEL 命令的实现（key 只读不接管）
 int storage_del(Storage *s, sds key) {
     if(!s || !key) return 0;
-    return hashtable_del(s->ht,key);
+    // ★ 这里就是“通用”最关键的一处体现：同一个 dictDelete，
+    //   在 storage 这张表（sdsDictType）上会真的 sdsfree 掉 key/value；
+    //   在跳表索引那张表（skipIndexDictType）上则什么都不做。
+    return dictDelete(s->ht, key);
 }
 
 // 释放所有内存
 void storage_free(Storage *s) {
     if(!s) return;
-    hashtable_free(s->ht);    // 释放哈希表内部所有节点（含 sds 键值）
+    dictRelease(s->ht);       // 释放哈希表内部所有节点（按 sdsDictType 释放 sds 键值）
     free(s);                  // 释放 Storage 结构体
 }

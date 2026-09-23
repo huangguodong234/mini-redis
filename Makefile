@@ -22,7 +22,7 @@ REPS  = 2000000
 TARGET  = mini-redis
 
 # 2. 源文件列表
-SRCS = src/server.c src/protocol.c src/storage.c src/hashtable.c src/skiplist.c src/zset.c src/main.c src/commands.c src/anet.c src/sds.c
+SRCS = src/server.c src/protocol.c src/storage.c src/dict.c src/skiplist.c src/zset.c src/main.c src/commands.c src/anet.c src/sds.c
 
 # 3. 将 .c 后缀替换为 .o；.d 是自动生成的依赖文件
 OBJS    = $(SRCS:.c=.o)
@@ -31,10 +31,10 @@ DEPS    = $(OBJS:.o=.d)
 # 4. 单元测试：tests/ 下每个 .c 自带 main()，链接通用模块。
 #    注意 COMMON_OBJS 里【不含】src/main.o，否则会撞 main 符号。
 #    多余的 .o 不会被链接进来，不影响产物。
-TEST_SRCS   = tests/test_sds.c tests/test_hashtable.c tests/test_skiplist.c tests/test_zset.c tests/test_skipspan.c
+TEST_SRCS   = tests/test_sds.c tests/test_dict.c tests/test_skiplist.c tests/test_zset.c tests/test_skipspan.c
 TEST_BINS   = $(TEST_SRCS:.c=)
 TEST_DEPS   = $(TEST_SRCS:.c=.d)
-COMMON_OBJS = src/sds.o src/hashtable.o src/skiplist.o src/zset.o
+COMMON_OBJS = src/sds.o src/dict.o src/skiplist.o src/zset.o
 
 # ------------------------------------------------------------
 # 默认目标
@@ -55,12 +55,34 @@ $(TARGET): $(OBJS)
 $(TEST_BINS): tests/%: tests/%.o $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+# ⚠ tests/test_lookup_order 是【白盒】测试：它 #include "../src/dict.c"，
+#   为了直接对拍内部函数 dictFindEntry（static inline，不导出）。
+#   因此它【不能】链 src/dict.o —— 会与包含进来的定义重复冲突。
+#   所以它不进 TEST_SRCS，单独给一条只链 src/sds.o 的规则。
+#   目标名【不能】叫 tests/test_lookup_order（会被上面的 tests/% 规则匹配）。
+test_lookup_order: tests/test_lookup_order.c src/dict.c src/sds.c include/dict.h include/sds.h
+	$(CC) $(CFLAGS) -o tests/test_lookup_order tests/test_lookup_order.c src/sds.c
+
+# ⚠ test_lookup_order 是【白盒】测试：它 #include "../src/dict.c" 以直接对拍
+#   内部函数 dictFindEntry（static inline，不导出）。因此它【不能】再链接
+#   src/dict.o —— 会重复定义 dictSdsHash 等符号。这里给它单独的规则：
+#   只链 src/sds.o。
+tests/test_lookup_order: tests/test_lookup_order.o src/sds.o
+	$(CC) $(CFLAGS) -o $@ $^
+
 # ------------------------------------------------------------
 # 跳表算法层微基准：绕开服务端框架（~50k QPS 上限）直接定时 skiplist API，
 # 实证 O(1) find / O(log n) range（span）。用法：make benskip 或
 #   make benskip RUN=<表大小>     例如 make benskip RUN=400000
+# 渐进式 rehash 微基准：量化"一次扩容造成的最大停顿"
+# 核心验证：最大停顿是否随 N 线性增长（线性=一次性搬迁；不变=渐进式）
+#   make benchrehash RUN=1000000
+benchrehash: bench/bench_rehash.c $(COMMON_OBJS)
+	$(CC) $(CFLAGS) -o /tmp/bench_rehash bench/bench_rehash.c src/dict.c src/sds.c
+	/tmp/bench_rehash $(RUN)
+
 benskip: bench/bench_skipspan.c $(COMMON_OBJS)
-	$(CC) $(CFLAGS) -o /tmp/bench_skipspan bench/bench_skipspan.c src/skiplist.c src/sds.c
+	$(CC) $(CFLAGS) -o /tmp/bench_skipspan bench/bench_skipspan.c src/skiplist.c src/dict.c src/sds.c
 	/tmp/bench_skipspan $(RUN) $(REPS)
 
 # ------------------------------------------------------------
@@ -69,9 +91,9 @@ test: all
 	./test.sh
 
 # 单元测试：逐个运行，任一失败则整体退出码非 0
-unit: $(TEST_BINS)
+unit: $(TEST_BINS) test_lookup_order
 	@fail=0; \
-	for t in $(TEST_BINS); do \
+	for t in $(TEST_BINS) tests/test_lookup_order; do \
 		echo "--- 运行 $$t ---"; \
 		if ./$$t; then :; else echo ">>> $$t 失败"; fail=1; fi; \
 	done; \
@@ -110,7 +132,7 @@ distclean: clean
 	rm -f final_bench.csv bench/*.csv
 
 # 伪目标声明（避免目录下恰好有同名文件导致冲突）
-.PHONY: all test unit check asan valgrind benskip clean distclean
+.PHONY: all test unit check asan valgrind benskip benchrehash clean distclean test_lookup_order
 
 # 引入自动生成的依赖；文件不存在时静默忽略（首次编译）
 -include $(DEPS)

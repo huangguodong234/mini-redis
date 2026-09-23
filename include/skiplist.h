@@ -2,6 +2,7 @@
 #define SKIPLIST_H
 
 #include "sds.h"
+#include "dict.h"   // ★ 通用哈希表：跳表用它做 member→node 索引（不再自造一份）
 
 /*我的跳表和Redis的跳表的区别：
 *   1.跳表结构体的不同：
@@ -34,7 +35,18 @@
 *            skiplist_find 从 O(N) 遍历第 0 层 变成 O(1) 哈希直查，同 Redis 的
 *            dict 辅助表。member→score 查找（zset_score）也随之变 O(1)。
 *        (C) 第 0 层仍是单向（member 查询无需 back 遍历），本轮不引入 backward。
-*/
+ *
+ *   ★★ 再一轮升级（消重）：索引不再自造，改用通用 dict
+ *        上一轮为了拿到 O(1) 的 find，本文件在跳表里又写了一份哈希表
+ *        （IndexNode / buckets / index_* 约 100 行）。现在那一块整体删除，
+ *        sl->index 改用通用 dict，挂上一份「借用语义」的
+ *        skipIndexDictType（destructor 传空操作）。于是同一份 dict
+ *        核心代码同时服务 storage（拥有）与本索引（借用），
+ *        两张 dictType 唯一的差别就是最后两行 destructor。
+ *
+ *        为什么原来接不进去、为什么必须同时改类型与所有权
+ *        —— 完整推导见 docs/dict-design.md。
+ */
 
 #define SKIPLIST_MAX_LEVEL 32  // 跳表最大层数
 
@@ -57,23 +69,15 @@ typedef struct SkipNode{
                                    //和 span 一起放进 SkipListLevel，Redis 同款结构。
 }SkipNode;
 
-// 内部哈希索引的桶节点（用于 O(1) 的 member → SkipNode 查找，同 Redis 的 dict）
-// key 是【借用引用】：指向所属 SkipNode 自己的 member（非持有、不 free）。
-// node 也是【借用引用】：指向索引对应的跳表节点（节点的生命周期由跳表管理）。
-typedef struct IndexNode{
-    sds key;                     // 借用：即 所指向 SkipNode 的 member
-    SkipNode *node;              // 借用：索引指向的跳表节点
-    struct IndexNode *next;      // 链地址法下一个节点
-}IndexNode;
-
 // 跳表结构体
 typedef struct{
     SkipNode *header;  //不存储任何数据，只作为查找的起点。
     int max_level;     //当前跳表中，除了 header 以外，存在的最高层级。
     int size;          //跳表中实际存储的元素个数（不包括 header）。
-    IndexNode **buckets;  // ★ 新增：member→SkipNode 哈希索引的桶数组（O(1) 查找）
-    int index_size;       // 索引中已存键的个数
-    int index_cap;        // 索引桶数
+    dict *index;       // ★ member → SkipNode 索引（同 Redis 的 dict 辅助表）
+                       //   key = SkipNode->member（sds），value = SkipNode*（零额外分配）。
+                       //   挂的是 skipIndexDictType（destructor 空操作）——借用语义，
+                       //   所以 skiplist_del / skiplist_free 必须「先摘索引条目，再释放节点」。
 }Skiplist;
 
 // 创建空跳表，初始化表头、层数等基础信息
@@ -107,6 +111,8 @@ int skiplist_del(Skiplist *sl,sds member);
 sds *skiplist_range(Skiplist *sl,int start,int stop);
 
 // 根据成员名查找节点（★现在是 O(1) 哈希直查，不再是 O(N) 遍历第 0 层）
+// 实现就是一行 dictFind(sl->index, member)：索引走通用 dict，
+// 挂在 skipIndexDictType（借用语义：命中返回的 SkipNode* 归跳表，调用方不得 free）。
 // 返回值：成功返回节点指针，找不到返回 NULL
 // member: 查询用 sds，只读不接管
 SkipNode *skiplist_find(Skiplist *sl,sds member);

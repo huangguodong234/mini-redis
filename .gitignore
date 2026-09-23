@@ -3,10 +3,14 @@
 *.d
 server
 mini-redis
+# 单元测试可执行文件（不带扩展名，逐个列出以免误伤同名目录）
 tests/test_sds
-tests/test_hashtable
+tests/test_dict
 tests/test_skiplist
 tests/test_zset
+tests/test_skipspan
+tests/test_lookup_order
+tests/test_hashtable
 test_skiplist
 test_zset
 test_hash
