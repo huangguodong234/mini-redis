@@ -234,6 +234,7 @@ static int dictExpand(dict *d)
     return 1;
 }
 
+//搬桶函数
 // 把旧表第 idx 个桶的整条链搬到新表（头插），并清空该旧桶。
 //
 // 这是搬迁的原子单位 —— 对应注释里流程图的最内层
@@ -256,6 +257,7 @@ static void dictBucketRehash(dict *d, long idx)
     d->buckets_old[idx] = NULL;
 }
 
+//缓存不友好的搬桶函数
 // 搬迁【一个】桶：从 rehashidx 开始找下一个非空桶并搬它（顺序扫描）。
 // 返回：1 = 本次推进了（搬了桶或跳过了空桶）；0 = 已扫到旧表末尾。
 //
