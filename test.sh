@@ -402,33 +402,53 @@ PYEOF
 assert_eq "客户端 RST 断连后服务器仍存活 (SIGPIPE 回归)" "OK" "$(py_rst_probe)"
 rcli DEL rst_key >/dev/null 2>&1
 
-# 8.2 并发能力（已知限制，只记录不计分）
-#     当前是阻塞式单连接串行：第 1 条连接不关，第 2 条就得不到响应。
-#     第 4 步引入 epoll 后，应把这里改成断言"第 2 条连接也能立刻收到 PONG"。
+# 8.2 并发能力（★ epoll 改造后升级为正式断言）
+#     改造前是阻塞式单连接串行：第 1 条连接不关，第 2 条就得不到响应。
+#     ae 事件循环改造后，多条连接应能【同时】被服务 —— 这里断言：
+#       ① 第 1 条连接只建立、不发数据（故意制造"卡住读"的场景）
+#       ② 第 2 条连接立刻发 PING，必须收到 PONG
+#       ③ 第 3 条也建一条，验证不止能服务两条
+#       ④ 通过第 2 条 SET / 第 1 条 GET 交叉，验证共享同一份存储
 py_concurrency_probe() {
     HOST="$HOST" PORT="$PORT" python3 - <<'PYEOF'
 import os, socket
 HOST, PORT = os.environ['HOST'], int(os.environ['PORT'])
+
+def cmd(s, *args):
+    out = ("*%d\r\n" % len(args)).encode()
+    for a in args:
+        a = a.encode() if isinstance(a, str) else a
+        out += ("$%d\r\n" % len(a)).encode() + a + b"\r\n"
+    s.sendall(out)
+    return s.recv(4096)
+
 try:
-    a = socket.create_connection((HOST, PORT), timeout=2)   # 第 1 条：建立后保持打开
-    b = socket.create_connection((HOST, PORT), timeout=2)   # 第 2 条：立刻发 PING
-    b.sendall(b"*1\r\n$4\r\nPING\r\n")
-    b.settimeout(1.5)
-    try:
-        d = b.recv(64)
-        out = "第 2 条连接立即收到回复（并发可用）" if b"PONG" in d else "第 2 条连接无回复"
-    except socket.timeout:
-        out = "第 2 条连接 1.5s 内无回复（被第 1 条阻塞）"
-    b.close()
-    a.close()
+    # ① 第 1 条：建立后保持打开且【不发任何数据】
+    a = socket.create_connection((HOST, PORT), timeout=2)
+
+    # ② 第 2 条：立刻发 PING，必须收到 PONG
+    b = socket.create_connection((HOST, PORT), timeout=2)
+    r = cmd(b, "PING")
+    if b"PONG" not in r:
+        print("第 2 条连接未收到 PONG（收到 %r）" % r[:40]); raise SystemExit
+    # ③ 第 3 条也连上
+    c = socket.create_connection((HOST, PORT), timeout=2)
+    if b"PONG" not in cmd(c, "PING"):
+        print("第 3 条连接未收到 PONG"); raise SystemExit
+    # ④ 交叉验证存储共享：B 写，A 读
+    cmd(b, "SET", "conc_key", "shared")
+    r = cmd(a, "GET", "conc_key")
+    if b"shared" not in r:
+        print("存储未共享（A 读到 %r）" % r[:40]); raise SystemExit
+    if b"PONG" not in cmd(a, "PING"):
+        print("第 1 条连接已失效"); raise SystemExit
+    a.close(); b.close(); c.close()
+    print("OK")
 except Exception as e:
-    out = "探测失败(%s)" % e.__class__.__name__
-print(out)
+    print("探测失败(%s)" % e.__class__.__name__)
 PYEOF
 }
-echo "  [NOTE] 并发能力：$(py_concurrency_probe)"
-echo "         当前为阻塞式单连接串行，属已知限制；epoll 改造后应改为断言「第 2 条也能收到 PONG」"
-echo ""
+assert_eq "并发能力：第 2/3 条连接可同时被服务（epoll 回归）" "OK" "$(py_concurrency_probe)"
 
 # 8.3 优雅退出回归（P0-2）：有客户端连接着时发 SIGINT，服务器必须能退出。
 #     修复前：readQueryFromClient 的 EINTR 分支无条件 continue，

@@ -22,7 +22,7 @@ REPS  = 2000000
 TARGET  = mini-redis
 
 # 2. 源文件列表
-SRCS = src/server.c src/protocol.c src/storage.c src/dict.c src/skiplist.c src/zset.c src/main.c src/commands.c src/anet.c src/sds.c
+SRCS = src/main.c src/server.c src/networking.c src/protocol.c src/commands.c src/storage.c src/sds.c src/anet.c src/dict.c src/skiplist.c src/zset.c src/ae.c
 
 # 3. 将 .c 后缀替换为 .o；.d 是自动生成的依赖文件
 OBJS    = $(SRCS:.c=.o)
@@ -73,8 +73,9 @@ tests/test_lookup_order: tests/test_lookup_order.o src/sds.o
 # ------------------------------------------------------------
 # 改造阶段 1：ae 事件循环骨架的空跑验证。
 # 独立产物，不动原有 mini-redis —— 便于阶段 0/1 对比。
+# ⚠ 必须链 networking.c：server.c 的 free_client 现在转发到 freeClient。
 # 用法：make stage1 && ./mini-redis-stage1
-STAGE1_SRCS = src/main_stage1.c src/ae.c src/anet.c src/server.c src/protocol.c src/sds.c src/commands.c src/storage.c src/dict.c src/skiplist.c src/zset.c
+STAGE1_SRCS = src/main_stage1.c src/ae.c src/anet.c src/server.c src/networking.c src/protocol.c src/sds.c src/commands.c src/storage.c src/dict.c src/skiplist.c src/zset.c
 stage1:
 	$(CC) $(CFLAGS) -o mini-redis-stage1 $(STAGE1_SRCS)
 

@@ -36,7 +36,8 @@
 
 #define DEFAULT_PORT 6379
 #define BACKLOG 10
-#define MAX_CLIENTS 10240
+/* MAX_CLIENTS 现在统一定义在 include/server.h（server.h 已被包含），
+ * 这里不再重复定义 —— 否则 -Wall 会报 "redefined"。 */
 
 /* 阶段 1 的「客户端」只需要这些 —— 真正的 Client 结构体留到阶段 2 */
 typedef struct Stage1Conn {

@@ -1,57 +1,71 @@
 #define _POSIX_C_SOURCE 200809L
-#include <stdio.h>      // printf, perror（自定义错误提示字符串）-输出失败原因
-#include <stdlib.h>     // exit（）
-#include <string.h>     // memset（目标内存的起始地址, 要填充的字节值, 填充的字节数)）-初始化函数 , strlen（）  
-#include <unistd.h>     // read（）, write（）, close（）
-#include <signal.h>     //信号处理    sigaction结构体 （sa_handler:信号处理指针，sa_mask:暂时屏蔽的信号，sa_flags:额外选项
-#include <time.h>       // time() 用于 srand() 播种
-#include <sys/types.h>  // 一些类型定义  volatile   sig_atomic_t
-#include <sys/socket.h> // socket（）, bind（）, listen（）, accept（）
-#include <netinet/in.h> // sockaddr_in 结构体{sin_family：地址家族，IPv4 填 AF_INET   sin_port：端口号，必须用 htons() 转成网络字节序 sin_addr.s_addr：IP 地址，INADDR_ANY 表示监听本机所有网络接口}
-#include <arpa/inet.h>  // htons（）, inet_ntoa()-表示把二进制IP地址转化为人类可以看的懂的语言
-#include <errno.h>        //errno()：全局变量，当系统调用错误时，记录错误的类型
-#include <stdlib.h>       // atoi()：字符串转整数（读取自定义端口）
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <errno.h>
+#include <fcntl.h>
 
+#include "ae.h"
 #include "server.h"
 #include "storage.h"
-#include "zset.h"  
+#include "zset.h"
 
-#define DEFAULT_PORT 6379 //默认监听端口（可用命令行参数或 PORT 环境变量覆盖）
-#define BACKLOG 10        //等待连接队列的最大长度（B6 修复：统一定义在此处，server.c 不再重复定义）
+#define DEFAULT_PORT 6379 // 默认监听端口（可用命令行参数或 PORT 环境变量覆盖）
+#define BACKLOG 10        // 等待连接队列的最大长度
 
+// 全局标志：是否继续运行（用 sig_atomic_t 保证在信号处理函数中安全读写）
+volatile sig_atomic_t Keep_running = 1;
 
-// 全局标志：是否继续运行（用 sig_atomic_t 保证在信号处理函数中安全读写
-volatile sig_atomic_t Keep_running =1;    //volatile -告诉编译器这是一个可以修改的变量
-//sig_atomic_t 一种特殊的整数类型，保证不会被信号处理打断一半
+/* ★ 全局服务状态 —— 由 networking.c 定义（它是主要使用者）。
+ *   这里只是 extern 引用，填好字段后事件回调就能通过它拿到 store/zset/el。
+ *   （放在 networking.c 而不是这里，是为了让不链接 main.c 的独立产物也能用。） */
+
+/* 事件循环指针的副本，专供信号处理函数调 aeStop（异步信号安全：只是置一个 int） */
+static aeEventLoop *g_el = NULL;
 
 // SIGINT 处理函数：当用户按下 Ctrl+C 时调用
 void handle_sighing(int sig){
-    (void) sig;   //避免编译器报未使用参数的警告
-    Keep_running =0;  //通知主循环退出  
+    (void) sig;
+    Keep_running = 0;
+    /* ★ 关键：让 aeMain 的循环退出。
+     *   只置 Keep_running 是不够的 —— aeMain 睡在 epoll_wait 里，
+     *   没有任何东西会去看那个标志。aeStop 会置 loop->stop，
+     *   aeMain 下一轮循环条件判断时就会退出。
+     *   （对比改造前：要靠 read() 被 EINTR 打断才能退，而且有客户端
+     *     连着时会永远退不出去。） */
+    if (g_el) aeStop(g_el);
 }
 
 // 注册信号处理
 void setup_signal_handler(void){
-    //注册信号处理
-    struct sigaction sa;        //信号处理结构体
-    memset(&sa,0,sizeof(sa));
-    sa.sa_handler =handle_sighing;  
-    sigemptyset(&sa.sa_mask);        // sigemptyset()不屏蔽信号函数 
-    sa.sa_flags =0;
-    sigaction(SIGINT,&sa,NULL);      //将SIGINT（Ctrl+c触发终止进程）绑定到sa中
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sighing;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
 
     // P0-1 修复：忽略 SIGPIPE。
     // 客户端发完命令不读回复就关闭（内核回 RST）、或用 SO_LINGER(1,0) 强制 RST 关闭时，
     // 本进程后续的 write() 会先收到 SIGPIPE，而它的【默认动作是终止进程】——
-    // 一个客户端就能把整个服务器杀掉，而且死在 free_client 之前，所有连接状态全丢。
-    // 忽略之后 write() 只返回 -1/EPIPE，由 send_response 当作普通写错误放弃本次即可。
-    // 用 write()（无法带 MSG_NOSIGNAL）的阻塞式模型必须做这一步，Redis 同样如此。
+    // 一个客户端就能把整个服务器杀掉。忽略之后 write() 只返回 -1/EPIPE，
+    // 由上层当作普通写错误处理。
     struct sigaction sa_pipe;
-    memset(&sa_pipe,0,sizeof(sa_pipe));
+    memset(&sa_pipe, 0, sizeof(sa_pipe));
     sa_pipe.sa_handler = SIG_IGN;
     sigemptyset(&sa_pipe.sa_mask);
-    sa_pipe.sa_flags =0;
-    sigaction(SIGPIPE,&sa_pipe,NULL);
+    sa_pipe.sa_flags = 0;
+    sigaction(SIGPIPE, &sa_pipe, NULL);
+}
+
+/* 设为非阻塞（listen fd 用；客户端 fd 由 networking.c 在 accept 后设置） */
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 int main(int argc, char **argv){
@@ -61,18 +75,15 @@ int main(int argc, char **argv){
     int port = DEFAULT_PORT;
     const char *env_port = getenv("PORT");
     if (env_port && *env_port) {
-        int ep = atoi(env_port);          // 环境变量优先于默认值
+        int ep = atoi(env_port);
         if (ep > 0 && ep <= 65535) port = ep;
     }
     if (argc >= 2) {
-        int ap = atoi(argv[1]);           // 命令行参数优先级最高
+        int ap = atoi(argv[1]);
         if (ap > 0 && ap <= 65535) port = ap;
     }
 
     // 初始化存储引擎
-    // P1-5 修复：原先不检查返回值。一旦 storage_init() / zset_create() 失败返回
-    // NULL，后续所有 SET/ZADD 都会在 storage_set_steal / zset_add 的判空里被
-    // 静默丢弃，而命令层照旧回 +OK —— 全程静默失败，客户端毫不知情。
     Storage *store = storage_init();
     ZSet *global_zset = zset_create();
     if (!store || !global_zset) {
@@ -89,49 +100,81 @@ int main(int argc, char **argv){
     /*创建服务器 socket（已绑定并监听）*/
     int server_fd = create_server_socket(port, BACKLOG);
 
-    //主循环，不断接受新客户端,受 keep_running 控制 ----
-    while(Keep_running){
-        struct sockaddr_in client_addr;    //客户端地址
-        socklen_t client_addr_len;            //客户端地址长度
-        client_addr_len = sizeof(client_addr);
-        /*client_fd 文件描述符 */
-        int client_fd= accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-        //当没有客户端连接时，accept() 会让进程睡着等待。
-        //比如按 Ctrl+C 时，内核向进程发送 SIGINT 信号。
-        //任何正在阻塞的系统调用（如 accept, read, sleep）会立即被中断并返回 -1
-        //同时把全局错误码 errno 设置为 EINTR
-
-        // 如果被信号中断（EINTR）且需要退出，则退出循环
-        if (client_fd == -1) {
-             // 如果被信号中断（EINTR）且需要退出，则退出循环
-            if(errno ==EINTR   ){
-                if(!Keep_running){
-                    break;
-                }else{
-                    continue;     //收到其他信号中断（如调试），继续等待
-                }
-            }
-            perror("accept 失败");
-            continue;
+    /* ★ listen fd 也要非阻塞 —— 否则 accept 可能卡住事件循环。
+     *   （accept 返回 EAGAIN 表示当前没有新连接，正常退出循环即可） */
+    if (set_nonblocking(server_fd) == -1) {
+        perror("set_nonblocking(server_fd)");
+        close(server_fd);
+        zset_free(global_zset);
+        storage_free(store);
+        return EXIT_FAILURE;
     }
-    
-    /**
-     * 做保活机制和配置内核接收和发射缓冲区
-     * 对新 accept 出来的 client fd 做全套 socket 配置
-     * 模仿 Redis：新客户端连接后一次性配置缓冲区、keepalive、nodelay，关闭Nagle算法
-     * idle=60, interval=10, cnt=3
-     */
-    anetConfigClientSocket(client_fd);
 
-    printf("客户端已连接：%s\n", inet_ntoa(client_addr.sin_addr));
-    readQueryFromClient(client_fd, store, global_zset);
+    /* ★ 创建事件循环：setsize 是容量上限，决定 events[] 数组能索引到多大的 fd。
+     *   传 MAX_CLIENTS + 16 是留余量 —— 实际需要的 fd 数 = 连接数 + 几个
+     *   （listen fd、epoll fd、标准流）。若 accept 得到的 fd 超出 setsize，
+     *   注册会失败（aeCreateFileEvent 返回 AE_ERR）。 */
+    aeEventLoop *el = aeCreateEventLoop(MAX_CLIENTS + 16);
+    if (!el) {
+        fprintf(stderr, "aeCreateEventLoop 失败\n");
+        close(server_fd);
+        zset_free(global_zset);
+        storage_free(store);
+        return EXIT_FAILURE;
     }
+
+    /* 填全局服务状态（事件回调通过它拿到 store/zset/el） */
+    g_server.store = store;
+    g_server.zset = global_zset;
+    g_server.el = el;
+    g_server.clients = NULL;
+    g_server.numclients = 0;
+    g_el = el;
+
+    /* ★ 注册 beforesleep：睡之前的收尾（阶段 3 在这里 flush 各客户端 outbuf） */
+    aeSetBeforeSleepProc(el, beforeSleep);
+
+    /* ★ 把 listen fd 注册进事件循环 —— 它可读就表示「有新连接」。
+     *   clientData 传 NULL（listen fd 没有对应的 Client）。 */
+    if (aeCreateFileEvent(el, server_fd, AE_READABLE,
+                          acceptTcpHandler, NULL) == AE_ERR) {
+        fprintf(stderr, "注册 listen fd 失败\n");
+        aeDeleteEventLoop(el);
+        close(server_fd);
+        zset_free(global_zset);
+        storage_free(store);
+        return EXIT_FAILURE;
+    }
+
+    printf("事件循环后端 = %s，最大连接数 = %d\n", aeGetApiName(), MAX_CLIENTS);
+
+    /* ★ 主循环：所有事件（新连接、命令到达）都在这里被分发。
+     *   对比改造前：accept 一个就陷进 readQueryFromClient 的阻塞读循环，
+     *   同一时刻只能服务一个客户端。 */
+    aeMain(el);
 
     // ---- 清理资源 ----
     printf("\n正在关闭服务器,释放内存...\n");
+
+    /* 关闭所有还连着的客户端（正常退出时它们可能都还活着） */
+    Client *c = g_server.clients;
+    while (c) {
+        Client *next = c->next;
+        close(c->fd);
+        if (c->argv) {
+            for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
+            free(c->argv);
+        }
+        sdsfree(c->querybuf);
+        free(c);
+        c = next;
+    }
+    g_server.clients = NULL;
+
+    aeDeleteEventLoop(el);     // 释放事件循环 + 后端状态（含 epoll 实例）
+    close(server_fd);
     zset_free(global_zset);
     storage_free(store);
-    close(server_fd);
     printf("所有资源已释放，再见！\n");
     return 0;
 }

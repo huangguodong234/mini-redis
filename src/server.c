@@ -78,20 +78,25 @@ Client *create_client(int fd){
     c->argv = NULL;
     c->argc = 0;
     c->argv_max = 0;
+    /* ★ 事件循环改造：链表指针置 NULL。真正挂进链表由 networking.c 的
+     *   acceptTcpHandler 调 clients_add 完成（在 create_client 之后）。 */
+    c->next = NULL;
+    c->prev = NULL;
 
     return c;
 }
 
 // 释放客户端（关闭连接并释放内存）
+//
+// ★ 事件循环改造后，真正的关闭逻辑搬到了 networking.c 的 freeClient()
+//   —— 因为「撤关注 → 关 fd → 摘链表 → 释放」这四步需要访问事件循环
+//   和客户端链表，属于网络驱动层的职责。
+//
+//   这里保留 free_client 作为兼容入口（原 main.c 的阻塞模型用它），
+//   直接转发。★ 注意：freeClient 会调 aeDeleteFileEvent，要求
+//   g_server.el 已初始化；未初始化时它会跳过事件注销（安全）。
 void free_client(Client *c) {
-    if (!c) return;
-    if (c->argv) {
-        for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);   // 每个元素是 sds
-        free(c->argv);
-    }
-    sdsfree(c->querybuf);       // 释放 sds 缓冲区
-    close(c->fd);
-    free(c);
+    freeClient(c);
 }
 
 // 发送 len 字节给客户端（底层唯一执行 write() 循环的发送函数）
@@ -240,83 +245,20 @@ int create_server_socket(int port, int backlog){
 
 /*
  * 第一层：readQueryFromClient
- * 对应 Redis 的 readQueryFromClient
  *
- * 职责：
- *   1. 创建 Client 结构体，封装 fd、sds 缓冲区、游标
- *   2. 循环从 socket 读取数据，追加到 querybuf（sds）尾部
- *   3. 每次读取后调用 processInputBuffer（第二层）尝试解析命令
- *   4. 客户端断开或出错时退出循环，释放 Client
- */
-void readQueryFromClient(int client_fd, Storage *store, ZSet *zset){
-    // 创建客户端状态结构体
-    Client *c = create_client(client_fd);
-    if (!c) {
-        fprintf(stderr, "创建客户端失败\n");
-        close(client_fd);
-        return;
-    }
-
-    int nread = 0;   // 初始化：若首轮循环直接跳出，nread 也不可未定义
-    char rbuf[4096]; // 临时读缓冲；读到的数据用 sdscatlen 追加到 sds，可任意拼接
-    // 2. 循环读取数据（读入临时缓冲，再追加到 sds——不再受固定大小限制）
-    //    P0-2 修复：循环条件带上退出标志。这一处是必要的——若 SIGINT 恰好在我们
-    //    "正在处理命令"的期间投递并被消费掉（此时并不阻塞在 read 上，拿不到
-    //    EINTR），之后回到这里再阻塞进 read() 就永远等不到第二次 EINTR 了。
-    //    放在循环头检查，每处理完一轮就重新确认一次退出意图。
-    //    ⚠ 关键：这个判断只会落在"本轮 processInputBuffer 已经把缓冲区排空之后"，
-    //    所以它不会丢掉任何已经收下的命令；丢命令的风险来自在解析循环内部
-    //    判标志，那种写法已经移除（见 processInputBuffer 的说明）。
-    while(Keep_running){
-        nread=read(c->fd, rbuf, sizeof(rbuf));
-        if(nread<0){
-            // B7 修复：被信号打断（SIGINT/调试器 attach 等）nread<0,不是客户端断开，
-            // 继续读即可；真正的读错误才退出
-            if(errno==EINTR){
-                // P0-2 修复：原先这里无条件 continue，Ctrl+C 置位 Keep_running 之后
-                // 仍会重新阻塞在 read()，于是只要有任意一个客户端连着（哪怕完全
-                // 空闲），服务器就永远退不出去。现在被打断时先看退出标志，
-                // 已置位则跳出循环，交回 main 收尾释放资源。
-                if(!Keep_running) break;
-                continue;
-            }
-            break;   // 出错
-        }
-        if(nread==0){
-            break;   // 客户端断开
-        }
-
-        // 追加到 sds 缓冲区尾部（sds 会自动扩容，多帧半包都能拼接完整）
-        // 先存到临时变量：sdscatlen OOM 时返回 NULL 但不释放旧 sds，
-        // 若直接赋给 c->querybuf 会因 NULL 覆盖而丢失旧指针，造成泄漏
-        sds nb = sdscatlen(c->querybuf, rbuf, (size_t)nread);
-        if (!nb) {
-            sdsfree(c->querybuf);   // 旧指针还在手上，主动释放，避免 OOM 泄漏
-            c->querybuf = NULL;     // 置 NULL，free_client 的 sdsfree(NULL) 为安全 no-op
-            fprintf(stderr, "客户端 %d 缓冲区扩容失败\n", c->fd);
-            break;
-        }
-        c->querybuf = nb;
-
-        // 3. 调用第二层解析（处理粘包/半包）
-        int prc = processInputBuffer(c, store, zset);
-        if (prc == -1) {
-            fprintf(stderr, "客户端 %d 协议错误，断开连接\n", c->fd);
-            break;
-        }
-    }
-
-    if (nread==0){
-       printf("客户端断开\n"); 
-    }else if(nread<0 && errno != EINTR){
-        // 收到 SIGINT 时我们是从 EINTR 分支主动跳出的，不是读错误，
-        // 不该打印 "Interrupted system call" 这种误导信息。
-        perror("read");
-    }
-
-    // 4. 释放客户端
-    free_client(c);
-}
+ * ★ 事件循环改造后，本函数【已搬到 src/networking.c】。
+ *
+ * 原因：它现在是事件循环的一个【回调】，签名必须是 aeFileProc：
+ *     void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask)
+ * 并且要负责「注册/注销事件」，属于网络驱动层的职责。
+ *
+ * 语义变化（改造的核心）：
+ *   改造前：while(Keep_running){ read(); processInputBuffer(); } —— 阻塞循环，
+ *           函数不返回直到客户端断开，所以同一时刻只能服务一个客户端。
+ *   改造后：读【一次】→ 追加 querybuf → processInputBuffer → 立刻返回。
+ *           剩下的数据下次 epoll 还会通知（水平触发）。
+ *
+ * 与 Redis 的 readQueryFromClient 语义一致。 */
 
 /*
  * 第二层：processInputBuffer
@@ -335,10 +277,10 @@ int processInputBuffer(Client *c,Storage *store, ZSet *zset){
     // 循环解析：只要游标后面还有数据，就尝试解析命令（处理粘包）
     // 这里【不】检查 Keep_running —— 本函数的契约是"把缓冲区里所有完整命令一次
     // 处理完"，中途因退出标志跳出会留下"处理了一半"的状态：虽然 sdsrange 会把
-    // 未处理数据保留在缓冲区里、随后由 free_client 统一释放（不是内存错误），
+    // 未处理数据保留在缓冲区里、随后由 freeClient 统一释放（不是内存错误），
     // 但客户端已经发来的命令会被无谓丢弃，而且让解析层多背了一个"感知关停"的
-    // 职责。退出意图统一由调用方 readQueryFromClient 的读循环负责判断，
-    // 那里只会在本函数返回（缓冲区已排空）之后才生效，因此不会丢命令。
+    // 职责。退出意图由事件循环统一负责（aeStop 让 aeMain 退出），
+    // 那只发生在本轮回调全部返回之后，因此不会丢命令。
     while((size_t)c->qb_pos < sdslen(c->querybuf)){
         // 按解析状态分流（不能只看首字节！）：
         //   1) multibulklen > 0 说明一条 RESP 命令正跨多次 read 解析中（上次的半包），
