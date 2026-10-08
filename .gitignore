@@ -3,6 +3,8 @@
 *.d
 server
 mini-redis
+mini-redis-stage1
+mini-redis-stage2
 # 单元测试可执行文件（不带扩展名，逐个列出以免误伤同名目录）
 tests/test_sds
 tests/test_dict
