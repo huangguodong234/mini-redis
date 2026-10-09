@@ -53,9 +53,9 @@
 
 /* 全局服务状态 —— ★ 定义在这里（而不是 main.c）：
  * 它是「网络驱动层需要的共享状态」，本文件是它的主要使用者
- * （accept 回调要用 store/zset、freeClient 要用 el）。
- * 定义在 networking.c 后，任何链接本文件的目标都可以用，
- * 包括 stage1 那种自己写 main 的独立产物。 */
+ * （accept 回调要用 store/zset）。
+ * 定义在 networking.c 后，任何链接本文件的目标都能读到它 ——
+ * 而不必依赖「必须先链接 main.c」这个隐含顺序。 */
 Server g_server;
 
 /* 前向声明：可写事件回调（定义在下方，签名要匹配 aeFileProc）。

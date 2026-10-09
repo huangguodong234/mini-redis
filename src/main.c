@@ -63,8 +63,8 @@ void setup_signal_handler(void){
 }
 
 /* 设为非阻塞（listen fd 用；客户端 fd 由 networking.c 在 accept 后设置）——
- * ★ 实现已搬到 include/util.h 的 static inline（原来 main.c / networking.c /
- *   main_stage1.c 各写了一份，三份会各自漂移）。 */
+ * ★ 实现已搬到 include/util.h 的 static inline（原来 main.c / networking.c
+ *   各写了一份，两份会各自漂移）。 */
 
 int main(int argc, char **argv){
     srand((unsigned)time(NULL));  // 用当前时间播种随机数，使跳表结构不再每次启动相同

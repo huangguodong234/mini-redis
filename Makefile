@@ -77,17 +77,6 @@ tests/test_lookup_order: tests/test_lookup_order.o src/sds.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ------------------------------------------------------------
-# 改造阶段 1：ae 事件循环骨架的空跑验证。
-# 独立产物，不动原有 mini-redis —— 便于阶段 0/1 对比。
-# ⚠ 必须链 networking.c：server.c 的 free_client 现在转发到 freeClient。
-#   且必须链 reply.c / parser.c：networking.c 的 readQueryFromClient 要调
-#   processInputBuffer，而解析层里又会调 send_error（编码层）。
-#   这三者的依赖是「网络层 → 解析层 → 编码层」的单向链。
-# 用法：make stage1 && ./mini-redis-stage1
-STAGE1_SRCS = src/main_stage1.c src/ae.c src/anet.c src/server.c src/networking.c src/reply.c src/parser.c src/protocol.c src/sds.c src/commands.c src/storage.c src/dict.c src/skiplist.c src/zset.c
-stage1:
-	$(CC) $(CFLAGS) -o mini-redis-stage1 $(STAGE1_SRCS)
-
 # ------------------------------------------------------------
 # 跳表算法层微基准：绕开服务端框架（~50k QPS 上限）直接定时 skiplist API，
 # 实证 O(1) find / O(log n) range（span）。用法：make benskip 或
@@ -150,7 +139,7 @@ distclean: clean
 	rm -f final_bench.csv bench/*.csv
 
 # 伪目标声明（避免目录下恰好有同名文件导致冲突）
-.PHONY: all test unit check asan valgrind benskip benchrehash clean distclean test_lookup_order stage1
+.PHONY: all test unit check asan valgrind benskip benchrehash clean distclean test_lookup_order
 
 # 引入自动生成的依赖；文件不存在时静默忽略（首次编译）
 -include $(DEPS)
