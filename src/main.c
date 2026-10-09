@@ -6,15 +6,16 @@
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "ae.h"
 #include "server.h"
+#include "util.h"       /* BACKLOG / set_nonblocking（全项目共用一份） */
 #include "storage.h"
 #include "zset.h"
 
 #define DEFAULT_PORT 6379 // 默认监听端口（可用命令行参数或 PORT 环境变量覆盖）
-#define BACKLOG 10        // 等待连接队列的最大长度
 
 // 全局标志：是否继续运行（用 sig_atomic_t 保证在信号处理函数中安全读写）
 volatile sig_atomic_t Keep_running = 1;
@@ -61,12 +62,9 @@ void setup_signal_handler(void){
     sigaction(SIGPIPE, &sa_pipe, NULL);
 }
 
-/* 设为非阻塞（listen fd 用；客户端 fd 由 networking.c 在 accept 后设置） */
-static int set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
+/* 设为非阻塞（listen fd 用；客户端 fd 由 networking.c 在 accept 后设置）——
+ * ★ 实现已搬到 include/util.h 的 static inline（原来 main.c / networking.c /
+ *   main_stage1.c 各写了一份，三份会各自漂移）。 */
 
 int main(int argc, char **argv){
     srand((unsigned)time(NULL));  // 用当前时间播种随机数，使跳表结构不再每次启动相同
@@ -123,10 +121,11 @@ int main(int argc, char **argv){
         return EXIT_FAILURE;
     }
 
-    /* 填全局服务状态（事件回调通过它拿到 store/zset/el） */
+    /* 填全局服务状态（事件回调通过它拿到 store/zset）。
+     * ★ 不再有 g_server.el —— 事件循环由回调参数传递，不放进全局。
+     *   见 include/server.h 的 Server 注释。 */
     g_server.store = store;
     g_server.zset = global_zset;
-    g_server.el = el;
     g_server.clients = NULL;
     g_server.numclients = 0;
     g_el = el;
@@ -156,21 +155,19 @@ int main(int argc, char **argv){
     // ---- 清理资源 ----
     printf("\n正在关闭服务器,释放内存...\n");
 
-    /* 关闭所有还连着的客户端（正常退出时它们可能都还活着） */
+    /* 关闭所有还连着的客户端（正常退出时它们可能都还活着）。
+     * ★ 复用 freeClient 的释放路径，而不是在这里把它的四步再抄一遍 ——
+     *   抄一遍就等于「释放逻辑有两份」，将来给 Client 加字段时必定漏一处。
+     *   传 NULL 表示不撤关注：事件循环马上就整个销毁了，逐个撤销纯属浪费。
+     *   ★ 先存 next 再关：freeClient 会把自己从链表摘掉。 */
     Client *c = g_server.clients;
     while (c) {
         Client *next = c->next;
-        close(c->fd);
-        if (c->argv) {
-            for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
-            free(c->argv);
-        }
-        sdsfree(c->querybuf);
-        sdsfree(c->outbuf);
-        free(c);
+        freeClient(NULL, c);
         c = next;
     }
     g_server.clients = NULL;
+    g_server.numclients = 0;
 
     aeDeleteEventLoop(el);     // 释放事件循环 + 后端状态（含 epoll 实例）
     close(server_fd);

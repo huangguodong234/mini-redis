@@ -25,7 +25,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -33,11 +32,11 @@
 
 #include "ae.h"
 #include "server.h"     /* create_server_socket / Keep_running / anet 包装 */
+#include "util.h"       /* BACKLOG / set_nonblocking（全项目共用一份） */
 
 #define DEFAULT_PORT 6379
-#define BACKLOG 10
-/* MAX_CLIENTS 现在统一定义在 include/server.h（server.h 已被包含），
- * 这里不再重复定义 —— 否则 -Wall 会报 "redefined"。 */
+/* BACKLOG 现在统一定义在 include/util.h（util.h 已被包含），
+ * 这里不再重复定义。MAX_CLIENTS 同样统一在 include/server.h。 */
 
 /* 阶段 1 的「客户端」只需要这些 —— 真正的 Client 结构体留到阶段 2 */
 typedef struct Stage1Conn {
@@ -68,17 +67,19 @@ static void conn_remove(Stage1Conn *c) {
     g_numconns--;
 }
 
-/* ---------- 设为非阻塞 ---------- */
-static int set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
+/* ---------- 设为非阻塞 ----------
+ * ★ 实现已搬到 include/util.h 的 static inline（原来本文件与 main.c /
+ *   networking.c 各写了一份）。 */
 
 /*
  * 关闭连接 —— ★ 严格按「撤销 → 关闭 → 释放 → 清账」四步。
  * 顺序不能换：DEL 必须在 close 之前（close 后 fd 无效会 EBADF；
  * 且 fd 会被内核立即复用，此时 DEL 可能误删新连接）。
+ *
+ * ★ 本函数是【阶段 1 独立产物自带的】，它用的是自己的 Stage1Conn（不是
+ *   server.h 的 Client），所以不能复用 networking.c 的 freeClient ——
+ *   两者的对象类型不同。这正是阶段 1 保持隔离的代价，也是它存在的意义：
+ *   它验证 ae 层本身，不牵扯 Client/解析/编码任何一层。
  */
 static void free_conn(Stage1Conn *c) {
     if (!c) return;

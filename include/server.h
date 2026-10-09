@@ -23,10 +23,10 @@ extern volatile sig_atomic_t Keep_running;
  * Client —— 每个连接的状态
  * ============================================================
  * ★ 改造后新增两个链表指针：Client 串成【双向链表】，用于
- *   「遍历所有客户端」（如 beforSleep 里 flush 输出、超时检查）。
+ *   「遍历所有客户端」（如 beforeSleep 里 flush 输出、超时检查）。
  *
- * 为什么是双向：free_client 要在任意位置 O(1) 摘除自己。
- *   单向链表摘除当前节点必须先找到前驱 → O(n)；而 free_client 会在
+ * 为什么是双向：freeClient 要在任意位置 O(1) 摘除自己。
+ *   单向链表摘除当前节点必须先找到前驱 → O(n)；而 freeClient 会在
  *   很多地方被调（协议错误、写错误、超时、Ctrl+C），每次都要 O(1)。
  *   代价是每个 Client 多 16 字节，相对 Client 本身可忽略。
  *
@@ -68,17 +68,29 @@ typedef struct Client {
 /* ============================================================
  * 全局服务状态
  * ============================================================
- * ★ 为什么需要它：事件回调的签名是固定的
+ * ★ 定义在 networking.c（它是主要使用者：accept 要用 store/zset，
+ *   freeClient 要用 el）；这里只是 extern 引用。
+ *
+ * ★ 为什么还需要全局：事件回调的签名是固定的
  *     void cb(aeEventLoop *el, int fd, void *clientData, int mask)
- *   只能拿到 clientData（= Client*）。但执行命令还需要 Storage 和 ZSet。
+ *   clientData 只够挂 Client*。但执行命令还需要 Storage 和 ZSet。
  *   两种办法：
  *     ① 回调的 clientData 挂一个「含 Client + 全局指针」的结构
  *     ② ★ 用全局变量（本项目选这个，Redis 也是这么做的）
- *   因为 storage/zset 本来就是【进程唯一】的，不是每个连接一份。 */
+ *   因为 storage/zset 本来就是【进程唯一】的，不是每个连接一份。
+ *
+ * ⚠ 使用约定（2026 拆分解耦后新增）—— 能不用 g_server 就不用：
+ *   · el：【已从本结构体删除】。所有需要事件循环的地方都改为从回调参数
+ *         拿（回调签名的第一个参数就是 aeEventLoop *el）。原来那个
+ *         g_server.el 字段在改完之后变成【只写不读】的死状态 ——
+ *         死状态比重复代码更危险：它看起来像"有地方在用"，
+ *         实际谁都没读，下次有人想用它时会发现它可能是 NULL/过期的。
+ *   · store / zset：回调签名里拿不到 → 这两项允许走 g_server
+ *         （真进程唯一，符合上面的理由 ②）。
+ *   ★ 判断标准：能从参数拿到的一律走参数；拿不到的才走全局。 */
 typedef struct {
     Storage *store;
     ZSet *zset;
-    aeEventLoop *el;
     Client *clients;      // 客户端双向链表头
     int numclients;       // 当前连接数（用于 maxclients 检查）
 } Server;
@@ -86,7 +98,7 @@ typedef struct {
 extern Server g_server;
 
 /* ============================================================
- * 网络驱动层（networking.c）
+ * 网络驱动层（src/networking.c）
  * ============================================================ */
 
 /* listen fd 可读回调：循环 accept 到 EAGAIN，为每个新连接建 Client 并注册可读。
@@ -98,47 +110,41 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask);
 void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask);
 
 /* beforesleep 钩子：本轮事件处理完、即将睡眠前的收尾。
- * ★ 阶段 3 会在这里 flush 各客户端的 outbuf；阶段 2 只做占位。 */
+ * ★ 在这里 flush 各客户端的 outbuf。 */
 void beforeSleep(aeEventLoop *el);
 
 /* 关闭连接并释放：★ 严格按「撤关注 → 关 fd → 摘链表 → 释放」四步。
- * 顺序不能换 —— 详见 networking.c 里的说明。 */
-void freeClient(Client *c);
+ * 顺序不能换 —— 详见 networking.c 里的说明。
+ * ★ el 用于撤关注；调用点（事件回调）手头都有它。传 NULL = 不撤关注。 */
+void freeClient(aeEventLoop *el, Client *c);
 
 /* ============================================================
- * 客户端生命周期 / socket 创建（server.c）
+ * 连接生命周期 / socket 创建（src/server.c）
  * ============================================================ */
 Client *create_client(int fd);
 void free_client(Client *c);              // 旧名，内部转发到 freeClient
 int create_server_socket(int port, int backlog);
 
 /* ============================================================
- * 响应发送（server.c）
+ * 响应编码层（src/reply.c）
  * ============================================================
- * ★ 事件循环改造后的核心变化：不再直接 write，而是【追加进 c->outbuf】。
+ * ★ 本层只把数据【追加进 c->outbuf】，永不执行 write、永不阻塞。
+ *   真正发出去的 write 在 networking.c 的 writeToClient —— 一入一出配对。
  *
- *   为什么：非阻塞 write 可能只发出去一部分（或返回 EAGAIN），
+ *   为什么必须先入队：非阻塞 write 可能只发出去一部分（或返回 EAGAIN），
  *   剩余数据必须存起来等下次「可写」通知 —— 否则就是发送半包。
  *
  *   发送时机：由 beforeSleep（和可写事件回调）调 writeToClient 统一 flush。
  *   放 beforeSleep 的理由：① 攒批（一条 +OK 从 3 次 write 降到 1 次）
  *   ② 该关闭的谁已确定，不会白写 ③ 写完即可撤掉 EPOLLOUT，epoll_wait 才能睡好。 */
 
-// 追加数据到客户端的输出缓冲（不再执行 write）。
-// ★ 参数从改造前的 int client_fd 换成 Client* —— 因为要访问 c->outbuf。
-//   fd 仍在 c 里（c->fd），真正 write 的是 writeToClient。
+// 追加数据到客户端的输出缓冲（不执行 write）。
+// ★ 参数是 Client*（不是 fd）—— 因为要访问 c->outbuf；fd 在 c->fd 里。
 void send_response(Client *c, const void *data, size_t len);
-
-// 把 c->outbuf 里的数据尽力写出去（★ 唯一执行 write() 的地方）。
-// ★ 内部函数（static），只在本文件用：真正执行 write + 处理 EAGAIN。
-//   返回 1 = 已全部发完（并取消可写注册）；0 = 还没发完（已注册可写）；
-//   -1 = 出错（调用方应关闭连接）。
-//   对外的可写事件回调是 writeToClientHandler（匹配 aeFileProc 的 void 返回）。
 
 // ==================== RESP 编码 / 发送辅助函数 ====================
 // 命令层（commands.c）只允许调用下面这些高层 API 来拼接响应，
-// 禁止直接碰 snprintf / write 的原始细节——所有“拼接+发送”逻辑都封装在
-// server.c / networking.c 里，全部经由 send_response 入队。
+// 禁止直接碰 snprintf / write 的原始细节。
 // 每个函数只负责一“种” RESP 数据类型，职责单一、可复用。
 void send_simple_string(Client *c, const char *s);
 void send_error(Client *c, const char *msg);
@@ -149,24 +155,30 @@ void send_null_bulk(Client *c);
 void send_array_len(Client *c, long n);
 
 /* ============================================================
- * 解析层（server.c）—— 三层解析器，不碰网络
- * ============================================================ */
+ * 解析层（src/parser.c）—— 三层解析器
+ * ============================================================
+ * ★ 本层只认字节流：不碰 socket、不碰事件循环、不碰响应编码。
+ *   它读 c->querybuf，写 c->argv / c->argc，然后调 handle_command。
+ *   唯一的"输出"是返回值：-1 表示该断开（由 networking.c 决定怎么断）。 */
 
 /*
-*第二层：调用processMultibulkBuffer，缩容缓存区
-*对应Redis processInputBuffer
+*第一层：入口。循环调用下层处理粘包，最后压缩缓冲区
+*对应 Redis 的 processInputBuffer
+*返回 1=正常（可能已处理若干命令，或半包等待）；-1=协议错误/应断开
 */
 int processInputBuffer(Client *c, Storage *store, ZSet *zset);
 
 /*
-*第三层：解析器（RESP 数组协议，首字节为 '*'）
-*对应Redis processMultibulkBuffer
+*第二层：解析器（RESP 数组协议，首字节为 '*'）
+*对应 Redis 的 processMultibulkBuffer
+*返回 1=成功一条；0=半包；-1=协议错误；-2=命令层要求断开(OOM)
 */
 int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset);
 
 /*
-*第三层（inline 分支）：解析空格分隔的行命令（首字节非 '*'），
+*第二层（inline 分支）：解析空格分隔的行命令（首字节非 '*'），
 *兼容 nc/curl 等不用 RESP 协议的客户端
+*返回同上
 */
 int processInlineCommand(Client *c, Storage *store, ZSet *zset);
 

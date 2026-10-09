@@ -1,66 +1,53 @@
-/* 我的mini-redis和Redis源码处理TCP字节流的区别：
+/* ============================================================
+ * server.c —— 连接生命周期 + 服务器 socket 创建
+ * ============================================================
  *
- * 1. 我的mini-redis的处理方式：
- *    直接设一个固定的缓冲区大小，用 read() 读取。每次 read() 后，
- *    直接把接收到的数据交给解析器。
+ * ★ 本文件只做两件事：
+ *     ① 服务器 socket 的「创建 → 绑定 → 监听」（create_server_socket）
+ *     ② 客户端对象的内存生命周期（create_client / free_client）
  *
- *    这会造成两个问题：
+ * ★ 本文件【不】包含（拆出去的理由都是「变化原因不同」）：
  *
- *    (1) 粘包问题：
- *        当几条相邻的字节流都比较短时，一次 read() 可能把它们全部接收。
- *        但我的解析器每次只处理一条命令，处理完就返回，剩余数据被丢弃。
- *        后果：后面的命令丢失，客户端收不到回复。
+ *   ┌─ 解析层 ──────────────────────────── src/parser.c
+ *   │   processInputBuffer / processMultibulkBuffer / processInlineCommand
+ *   │   变化原因：协议规则变了（RESP 版本、inline 语法）
+ *   │   ↑ 和 socket、和事件循环都无关 —— 它只认字节流
+ *   │
+ *   ├─ 响应编码层 ──────────────────────── src/reply.c
+ *   │   send_response + 7 个 send_*
+ *   │   变化原因：RESP 输出格式变了
+ *   │   ↑ 和 writeToClient 是一对（入队/出队），本该同侧
+ *   │
+ *   └─ 网络驱动层 ──────────────────────── src/networking.c
+ *       acceptTcpHandler / readQueryFromClient / freeClient / writeToClient
+ *       变化原因：网络模型变了（阻塞 → epoll → 以后 io_uring）
  *
- *    (2) 半包问题：
- *        当字节流很长时，一次 read() 读不完。解析器收到的字符串被截断，
- *        末尾不是 \r\n 结束，格式不合法，解析器返回 NULL。
- *        后果：命令执行失败，且已读取的半截数据被下次 read() 覆盖，
- *        永远拼不出完整命令。
+ *   拆分前这三个职责全挤在本文件里（526 行），于是「改协议解析」和
+ *   「改 socket 创建」会打在同一份代码上 —— 这就是耦合的定义：
+ *   不是文件里东西多，而是不相关的变化互相牵动。
  *
- * 2. Redis的处理方式：
- *    给每个客户端设一个动态缓冲区（SDS），把读到的数据追加到缓冲区尾部。
- *    设计一个游标（qb_pos），标记当前解析进度。
- *
- *    核心机制：
- *    - 解析过程中边解析边移动游标。当发现数据不够（缺 \r\n 或字符串
- *      未接收完整），游标停在当前位置，函数直接返回。
- *    - 下次新数据到达，追加到缓冲区尾部，从上次游标位置继续解析——
- *      就像游戏存档，不需要重打第一关。这就是"状态机"的核心思想：
- *      解析器本身无状态，状态全部存在游标和缓冲区里。
- *    - 解析完一条命令后，游标已指向下一条命令的起始位置。while 循环
- *      检查缓冲区里还有未处理数据，立刻进入下一轮解析，无需再次 read()。
- *      多条命令在一次 processInputBuffer 调用中全部处理完——这就是
- *      解决粘包的关键。
- *    - 当游标前方堆积了大量已解析完的无用数据时，Redis 会用 sdsrange
- *      把未处理部分移到缓冲区头部，释放前面的空间。SDS 的 sdsrange 是
- *      O(1) 更新 len 字段，不需要重新分配内存。这个优化在长连接场景下
- *      很重要。
- *
- *    缓冲区的优势：
- *    - 自动扩容，不受固定大小限制。SDS 的空间预分配策略保证扩容
- *      不会频繁触发 realloc。
- *    - 记录 len 字段，O(1) 获取缓冲区当前长度。在单条数据特别大时，
- *      不需要从数据头遍历到数据尾来判断缓冲区状态。
+ * ★ 本文件也【不】再定义 g_server —— 它属于网络驱动层（见 networking.c）。
  */
 
-
 #define _POSIX_C_SOURCE 200809L
-#include <stdio.h>      // printf, perror（自定义错误提示字符串）-输出失败原因
-#include <stdlib.h>     // exit（）
-#include <unistd.h>     // read（）, write（）, close（）
-#include <sys/socket.h> // socket（）, bind（）, listen（）, accept（）
-#include <netinet/in.h> // sockaddr_in 结构体{sin_family：地址家族，IPv4 填 AF_INET   sin_port：端口号，必须用 htons() 转成网络字节序 sin_addr.s_addr：IP 地址，INADDR_ANY 表示监听本机所有网络接口}
-#include <string.h>    // strlen, memset
-#include <errno.h>     // errno、EINTR（B7 修复：区分"被信号打断"和"客户端断开"）
+#include <stdio.h>      // printf, perror, fprintf
+#include <stdlib.h>     // malloc, free, exit
+#include <string.h>     // memset
+#include <unistd.h>     // close
+#include <sys/socket.h> // socket(), bind(), listen()
+#include <netinet/in.h> // sockaddr_in / INADDR_ANY / htons
 
 #include "server.h"
-#include "protocol.h"   
-#include "commands.h"   // handle_command
+#include "anet.h"       // anetSetReuseAddr
+#include "sds.h"
 
-// 注意：PORT / BACKLOG 统一定义在 main.c（B6 修复：本文件不再用宏，
-// create_server_socket 严格使用传入的 port / backlog 参数）
-
-// 创建客户端结构体
+/* ------------------------------------------------------------
+ * create_client —— 分配并初始化一个客户端对象
+ * ------------------------------------------------------------
+ * ★ 只做「内存 + 状态初始化」，不做任何 socket 操作 ——
+ *   所以它不需要知道 fd 从哪来（accept 的细节留在 networking.c）。
+ *   这也是为什么它留在这个文件：它是对象生命周期，不是网络行为。
+ */
 Client *create_client(int fd){
     Client *c=malloc(sizeof(Client));
     if(!c) return NULL;
@@ -74,6 +61,7 @@ Client *create_client(int fd){
     }
     // ★ 输出缓冲区（非阻塞模型必须）：待发送的数据攒在这里，
     //   由 beforeSleep / 可写回调调 writeToClient 发出。
+    //   生产者在 reply.c 的 send_response，消费者在 networking.c。
     c->outbuf = sdsempty();
     if (!c->outbuf) {
         sdsfree(c->querybuf);
@@ -86,7 +74,7 @@ Client *create_client(int fd){
     c->argv = NULL;
     c->argc = 0;
     c->argv_max = 0;
-    /* ★ 事件循环改造：链表指针置 NULL。真正挂进链表由 networking.c 的
+    /* ★ 链表指针置 NULL。真正挂进链表由 networking.c 的
      *   acceptTcpHandler 调 clients_add 完成（在 create_client 之后）。 */
     c->next = NULL;
     c->prev = NULL;
@@ -94,166 +82,55 @@ Client *create_client(int fd){
     return c;
 }
 
-// 释放客户端（关闭连接并释放内存）
-//
-// ★ 事件循环改造后，真正的关闭逻辑搬到了 networking.c 的 freeClient()
-//   —— 因为「撤关注 → 关 fd → 摘链表 → 释放」这四步需要访问事件循环
-//   和客户端链表，属于网络驱动层的职责。
-//
-//   这里保留 free_client 作为兼容入口（原 main.c 的阻塞模型用它），
-//   直接转发。★ 注意：freeClient 会调 aeDeleteFileEvent，要求
-//   g_server.el 已初始化；未初始化时它会跳过事件注销（安全）。
-void free_client(Client *c) {
-    freeClient(c);
-}
-
-/* ============================================================
- * 响应发送：入队 + 由事件循环 flush
- * ============================================================
+/* ------------------------------------------------------------
+ * free_client —— 释放客户端
+ * ------------------------------------------------------------
+ * ★ 真正的关闭逻辑在 networking.c 的 freeClient()：
+ *   「撤关注 → 关 fd → 摘链表 → 释放」四步需要访问事件循环和客户端
+ *   链表，属于网络驱动层的职责（本文件连 ae.h 都没包含）。
  *
- * ★ 事件循环改造的核心变化 —— 对比改造前后：
- *
- *   改造前（阻塞模型）：
- *     send_response 直接 while 循环 write()，直到整条响应发完才返回。
- *     「数据还没发出去」这个状态由【内核发送缓冲区】暗中承担，
- *     代价是：对端读得慢时，本进程会卡在 write 里，整个服务器停摆。
- *
- *   改造后（非阻塞事件循环）：
- *     send_response 只把数据【追加进 c->outbuf】，一次内存拷贝，永不阻塞。
- *     真正的 write 交给 writeToClient（networking.c），
- *     由 beforeSleep（以及可写事件回调）驱动。
- *
- * ★ 「发送未完成」这个状态从内核转移到了我们自己手上 —— 载体就是 outbuf。
- *   这是非阻塞 IO 必须付的代价（也是必须做的事）：非阻塞 write 可能只发出
- *   去一部分（n < len）或完全发不出去（EAGAIN），剩余部分不存起来就是
- *   「发送半包」，客户端会一直等后半条 RESP 回复。
- *
- * ★ 为什么「攒进缓冲」在改造后反而更快：
- *   改造前一条 +OK 要 3 次 write（"+"/"OK"/"\r\n"）≈ 3 次系统调用；
- *   现在 3 次 sdscatlen（内存操作）攒成 1 次 write。
+ *   这里保留 free_client 作为兼容入口，直接转发。
+ * ★ el 传 NULL：本条路径【不撤关注】，调用方必须自己保证该 fd 已从
+ *   事件循环里摘掉（或在事件循环销毁之后才调用）。这是旧的阻塞模型
+ *   遗留入口，新代码请直接用 freeClient(el, c)。
  */
-
-// 追加 len 字节到客户端的输出缓冲。
-// ★ 参数是 Client*（不是 fd）—— 因为要访问 c->outbuf。fd 在 c->fd 里。
-// ★ 本函数【不】执行 write，所以永远不阻塞、也不会失败（除 OOM）。
-void send_response(Client *c, const void *data, size_t len){
-    if (!c || !data || len == 0) return;
-
-    /* sds 是二进制安全的（带长度），所以数据里的 '\0' 不会截断 */
-    sds nb = sdscatlen(c->outbuf, data, len);
-    if (!nb) {
-        /* OOM：outbuf 保持原样（sdscatlen 失败不释放旧 sds）。
-         * 这里只能放弃本次追加 —— 不 freeClient，因为调用方（命令层）
-         * 可能还在用它，而且丢掉一条回复比断开连接更温和。
-         * ★ 注意：调用方无法感知这个失败（签名是 void），这是当前的局限；
-         *   Redis 会用 addReplyError 之类显式处理 OOM。 */
-        fprintf(stderr, "[fd=%d] 输出缓冲扩容失败，丢弃 %zu 字节\n", c->fd, len);
-        return;
-    }
-    c->outbuf = nb;
+void free_client(Client *c) {
+    freeClient(NULL, c);
 }
 
-// ==================== RESP 编码 / 发送辅助函数 ====================
-// 每个函数把一种 RESP 数据类型「拼接」封装成一步，命令层只调这些 API。
-//
-// 统一思路：把 RESP 拆成前缀/内容/后缀几段，逐段 send_response 追加进 outbuf：
-//   - 固定字面量（":"、"$"、"\r\n" 等）直接追加；
-//   - 长度不定的字符串（s / msg / val 数据）按 strlen/sdslen 按长度追加，绝不 %s；
-//   - 数字只用一个“数学上有界”的小临时数组装 ASCII（long/size_t 十进制
-//     最多 20 位 + 符号，24 字节足够），不存在“长度未知的固定数组”截断隐患。
-//
-// ★ 改造后这些函数仍然「分段追加」——但分段本身不再有代价了：
-//   每个分片只是 sdscatlen 到同一块 sds，最后由 writeToClient 一次性发出。
-//   改造前它们是 3 次系统调用，现在是 1 次。
-
-// 简单字符串  +<s>\r\n：分三段  "+"  s  "\r\n"
-void send_simple_string(Client *c, const char *s){
-    if(!s) return;
-    send_response(c, "+", 1);
-    send_response(c, s, strlen(s));   // s 长度任意，按长度发
-    send_response(c, "\r\n", 2);
-}
-
-// 错误  -<msg>\r\n：分三段  "-"  msg  "\r\n"
-void send_error(Client *c, const char *msg){
-    if(!msg) return;
-    send_response(c, "-", 1);
-    send_response(c, msg, strlen(msg));   // msg 长度任意，按长度发
-    send_response(c, "\r\n", 2);
-}
-
-// 整数  :<n>\r\n：n 是 long，十进制位数数学上有界（≤20 位），小数组足够
-void send_integer(Client *c, long n){
-    char num[24];
-    int len = snprintf(num, sizeof(num), ":%ld\r\n", n);
-    send_response(c, num, (size_t)len);
-}
-
-// 批量字符串（按明确长度）：$<len>\r\n + <data> + \r\n，二进制安全
-// len 是 size_t，十进制位数数学上有界（≤20 位），片段依次追加
-void send_bulk_string_len(Client *c, const void *data, size_t len){
-    char hdr[24];
-    int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
-    send_response(c, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
-    send_response(c, data, len);         // 数据（按长度，二进制安全）
-    send_response(c, "\r\n", 2);         // 尾部
-}
-
-// 批量字符串（sds 版）：val == NULL → $-1\r\n，否则按 sdslen 发完整数据
-void send_bulk_string(Client *c, sds val){
-    if(!val){
-        send_null_bulk(c);
-        return;
-    }
-    char hdr[24];
-    size_t len = sdslen(val);
-    int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
-    send_response(c, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
-    send_response(c, val, len);          // 数据（按长度，二进制安全）
-    send_response(c, "\r\n", 2);         // 尾部
-}
-
-// 空批量字符串  $-1\r\n  （注意：$-1\r\n 只有 5 字节，发送长度传 5，
-//                         若误传 strlen("$-1\r\n")=6 会把结尾 '\0' 也发出去，
-//                         在回复流里多播一个 NUL 字节，破坏二进制精确客户端）
-void send_null_bulk(Client *c){
-    send_response(c, "$-1\r\n", 5);
-}
-
-// 数组头  *<n>\r\n：n 是 long，十进制位数数学上有界（≤20 位），小数组足够
-void send_array_len(Client *c, long n){
-    char num[24];
-    int len = snprintf(num, sizeof(num), "*%ld\r\n", n);
-    send_response(c, num, (size_t)len);
-}
-
-/*
-*服务端流程：创建socket(int domain（地址族）,int type（套接字类型）,int protocol（传输协议）我们填 0-TCP)，绑定端口(bing(套接字描述符,地址结构体指针, 地址结构体的大小)),
-*开始监听（listen（套接字描述符, 等待队列最大长度））接受客户端的连接（accept(监听的套接字描述符，客户端地址结构体指针, 客户端地址长度变量的指针)）,
-*读写数据（read（文件描述符，存放数据的数组，存放的数据的最大字节数-1） write（文件描述符，要发送的数据的数组，要发送的字节数）），挂断（close(要挂断的描述符))
-*/
-
-/*创建服务器 socket（已绑定并监听）*/
+/* ------------------------------------------------------------
+ * create_server_socket —— 创建「已绑定并监听」的服务器 socket
+ * ------------------------------------------------------------
+ * 服务端流程：
+ *   创建 socket(int 地址族, int 套接字类型, int 传输协议) → 我们填 0 即 TCP
+ *   绑定端口 bind(套接字描述符, 地址结构体指针, 地址结构体大小)
+ *   开始监听 listen(套接字描述符, 等待队列最大长度)
+ *   之后由事件循环 accept 新连接（见 networking.c 的 acceptTcpHandler）
+ *
+ * ★ 失败处理策略是「fail-fast」：socket 创建/绑定/监听失败都直接 exit，
+ *   因为没有监听 socket 的服务器没有任何可用性可言，硬撑着只会更难排查。
+ *   （客户端的失败则可以优雅降级 —— 见 acceptTcpHandler 里的 close+continue）
+ */
 int create_server_socket(int port, int backlog){
     int server_fd;     //server_fd 套接字描述符
     struct sockaddr_in server_addr;   //服务器地址
-    
-    //创建socker
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);   
+
+    //创建 socket
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         perror("socket 创建失败");
         exit(EXIT_FAILURE);    //EXIT_FAILURE  表示程序异常退出
     }
     printf("socket 创建成功\n");
 
-    //解决重启TIME_WAIT端口占用
+    //解决重启 TIME_WAIT 端口占用
     anetSetReuseAddr(server_fd);
 
     //  绑定地址和端口
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons((uint16_t)port);   // B6 修复：用参数，不用宏
+    server_addr.sin_port = htons((uint16_t)port);
 
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
         perror("bind 失败");
@@ -263,7 +140,7 @@ int create_server_socket(int port, int backlog){
     printf("绑定端口 %d 成功\n", port);
 
     //开始监听
-    if (listen(server_fd, backlog) == -1) {          // B6 修复：用参数
+    if (listen(server_fd, backlog) == -1) {
         perror("listen 失败");
         close(server_fd);
         exit(EXIT_FAILURE);
@@ -271,256 +148,4 @@ int create_server_socket(int port, int backlog){
     printf("服务器正在监听 0.0.0.0:%d ...\n", port);  // INADDR_ANY 如实写成 0.0.0.0
 
     return server_fd;
-}
-
-/*
- * 第一层：readQueryFromClient
- *
- * ★ 事件循环改造后，本函数【已搬到 src/networking.c】。
- *
- * 原因：它现在是事件循环的一个【回调】，签名必须是 aeFileProc：
- *     void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask)
- * 并且要负责「注册/注销事件」，属于网络驱动层的职责。
- *
- * 语义变化（改造的核心）：
- *   改造前：while(Keep_running){ read(); processInputBuffer(); } —— 阻塞循环，
- *           函数不返回直到客户端断开，所以同一时刻只能服务一个客户端。
- *   改造后：读【一次】→ 追加 querybuf → processInputBuffer → 立刻返回。
- *           剩下的数据下次 epoll 还会通知（水平触发）。
- *
- * 与 Redis 的 readQueryFromClient 语义一致。 */
-
-/*
- * 第二层：processInputBuffer
- * 对应 Redis 的 processInputBuffer
- *
- * 职责：
- *   1. 循环调用 processMultibulkBuffer 解析并执行命令（处理粘包）
- *   2. 如果遇到半包（数据不够），停止循环，等待下次读数据
- *   3. 压缩缓冲区：把已处理的垃圾数据移除
- *
- * 返回值：
- *   1  - 正常（可能处理了若干命令，或者半包等待）
- *  -1  - 协议错误或客户端应断开
- */
-int processInputBuffer(Client *c,Storage *store, ZSet *zset){
-    // 循环解析：只要游标后面还有数据，就尝试解析命令（处理粘包）
-    // 这里【不】检查 Keep_running —— 本函数的契约是"把缓冲区里所有完整命令一次
-    // 处理完"，中途因退出标志跳出会留下"处理了一半"的状态：虽然 sdsrange 会把
-    // 未处理数据保留在缓冲区里、随后由 freeClient 统一释放（不是内存错误），
-    // 但客户端已经发来的命令会被无谓丢弃，而且让解析层多背了一个"感知关停"的
-    // 职责。退出意图由事件循环统一负责（aeStop 让 aeMain 退出），
-    // 那只发生在本轮回调全部返回之后，因此不会丢命令。
-    while((size_t)c->qb_pos < sdslen(c->querybuf)){
-        // 按解析状态分流（不能只看首字节！）：
-        //   1) multibulklen > 0 说明一条 RESP 命令正跨多次 read 解析中（上次的半包），
-        //      当前游标处的字节是该命令的参数（$L...），必须继续走 multibulk 状态机——
-        //      若只看首字节，'$' 会被误判成 inline 行，参数被当成"未知命令"。
-        //   2) 否则按首字节：'*' 走 RESP 数组协议，其余走 inline（空格/Tab 分隔的行，
-        //      如 "SET k v"，兼容 nc / curl 等经典用法）
-        const char *p = c->querybuf + c->qb_pos;
-        int rc;
-        if (c->multibulklen > 0 || *p == '*') {
-            rc = processMultibulkBuffer(c, store, zset);
-        } else {
-            rc = processInlineCommand(c, store, zset);
-        }
-        if ( rc == 1){
-            // 成功，继续处理下一条
-           continue;
-        }else if(rc == 0){
-            // 半包，跳出等待新数据
-            break;
-        }else if(rc == -1){
-            // 协议错误，发送错误并断开/清空缓冲区
-            send_error(c, "ERR protocol error");
-            return -1;
-        }else if(rc == -2){
-            // 命令层要求断开（如 OOM），错误响应已在命令层发出，直接断开
-            return -1;
-        }
-    }
-
-    // 缓冲区压缩：把已解析完的无用数据移除
-    // 用 sdsrange 把 [qb_pos, len-1] 的未处理数据整体移到头部（只 memmove + 改 len）
-    if (c->qb_pos > 0){
-        sdsrange(c->querybuf, (long)c->qb_pos, -1);
-        c->qb_pos = 0;
-    }
-    return 1;
-}
-
-/*
- * 第三层：processMultibulkBuffer
- * 对应 Redis 的 processMultibulkBuffer
- *
- * 状态机三个步骤：
- *   1. 解析参数个数 *N\r\n
- *   2. 循环解析每个参数：$L\r\n + 内容\r\n
- *   3. 全部解析完 → 执行命令
- *
- * 返回值：
- *   1  - 成功解析并执行了一条命令
- *   0  - 数据不够（半包），需要更多数据
- *  -1  - 协议错误
- */
-
-int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
-    const char *p;
-    const char *next = NULL;
-    int argc = 0;
-    long bulklen = 0;
-    int rc;
-
-    /* ========== 状态一：解析参数个数 *N\r\n ========== */
-    if (c->multibulklen == 0) {
-        c->cmd_start = c->qb_pos;
-
-        p = c->querybuf + c->qb_pos;
-        rc = parse_multibulk_header(p, &next, &argc);
-        if (rc == 0) return 0;
-        if (rc < 0)  return -1;
-
-        c->multibulklen = argc;
-        c->qb_pos = next - c->querybuf;
-
-        // 防御性清理 argv（如果之前残留）
-        if (c->argv) {
-            for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
-            free(c->argv);
-            c->argv = NULL;
-            c->argv_max = 0;
-            c->argc = 0;
-        }
-        c->argv = malloc(argc * sizeof(sds));
-        if (!c->argv) {
-            c->multibulklen = 0;
-            return -1;
-        }
-        c->argv_max = argc;
-        c->argc = 0;
-    }
-
-    /* ========== 状态二 + 状态三：循环解析每个参数 ========== */
-    while (c->multibulklen > 0) {
-        // 半包保护：游标已到缓冲区末尾（头部 *N 已解析、参数数据还没到齐）时，
-        // 绝不能去读 '\0' 终止符再喂给 parse_bulk_header（那会被当成协议错误）——
-        // 返回 0 等下次 read 补齐数据。TCP 不保证一次 read 收到完整命令。
-        if ((size_t)c->qb_pos >= sdslen(c->querybuf)) return 0;
-        p = c->querybuf + c->qb_pos;
-        // 状态二：解析 $L\r\n
-        if (c->bulklen == -1) {
-            rc = parse_bulk_header(p, &next, &bulklen);
-            if (rc == 0) return 0;
-            if (rc < 0)  return -1;
-
-            c->bulklen = bulklen;
-            c->qb_pos = next - c->querybuf;
-        }
-
-        // 状态三：提取内容（sds，二进制安全）
-        p = c->querybuf + c->qb_pos;
-        sds content = NULL;
-        rc = extract_bulk_content(p, c->bulklen, &content, &next, c->querybuf + sdslen(c->querybuf));
-        if (rc == 0) return 0;
-        if (rc < 0)  return -1;
-
-        c->argv[c->argc++] = content;
-        c->qb_pos = next - c->querybuf;
-        c->bulklen = -1;
-        c->multibulklen--;
-    }
-
-    /* ========== 所有参数提取完毕，执行命令 ========== */
-    Command cmd;               // 薄包装：把 argc + argv 提交给命令层（借视图）
-    cmd.argc = c->argc;
-    cmd.argv = c->argv;
-    int hrc = handle_command(c, &cmd, store, zset);
-
-    // 释放 argv（每个元素是 sds）
-    for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
-    free(c->argv);
-    c->argv = NULL;
-    c->argc = 0;
-    c->argv_max = 0;
-
-    c->multibulklen = 0;
-    c->bulklen = -1;
-    // B8 修复：命令层要求断开（OOM）时返回 -2，错误响应已由命令层发出
-    return (hrc == -1) ? -2 : 1;
-}
-
-/*
- * 第三层（inline 分支）：processInlineCommand
- * 解析一行空格/Tab 分隔的 inline 命令（如 "SET k v"，兼容 nc/curl 等
- * 不使用 RESP 协议的客户端）。以 \r\n 或 \n 为行结束。
- *
- * 返回值：
- *   1  - 成功执行了一条命令（或跳过一个空行）
- *   0  - 数据不够（半包），需要更多数据
- *  -1  - 协议错误（token 数超 1024）或 OOM，应断开
- */
-int processInlineCommand(Client *c, Storage *store, ZSet *zset) {
-    const char *p = c->querybuf + c->qb_pos;
-    const char *buf_end = c->querybuf + sdslen(c->querybuf);
-
-    // 找行结束符（\r\n 或裸 \n 都认）
-    const char *line_end = memchr(p, '\n', (size_t)(buf_end - p));
-    if (!line_end) return 0;                      // 半包
-
-    size_t line_len = (size_t)(line_end - p);
-    if (line_len > 0 && p[line_len - 1] == '\r') line_len--;   // 去掉 \r
-
-    // 第一遍：数 token（连续空白当一个分隔；上限 1024，与 proto-max-argc 一致）
-    int argc = 0;
-    int in_token = 0;
-    for (size_t i = 0; i < line_len; i++) {
-        int blank = (p[i] == ' ' || p[i] == '\t');
-        if (!blank && !in_token) {
-            argc++;
-            in_token = 1;
-            if (argc > 1024) return -1;           // 参数个数超限，协议错误
-        } else if (blank) {
-            in_token = 0;
-        }
-    }
-
-    // 空行：直接跳过不报错（Redis 同样忽略空行）
-    if (argc == 0) {
-        c->qb_pos += (size_t)(line_end - p) + 1;
-        return 1;
-    }
-
-    sds *argv = malloc(argc * sizeof(sds));
-    if (!argv) return -1;                         // OOM，断开
-
-    // 第二遍：逐个构建 token（sds，二进制安全）
-    int idx = 0;
-    size_t i = 0;
-    while (idx < argc && i < line_len) {
-        while (i < line_len && (p[i] == ' ' || p[i] == '\t')) i++;
-        size_t start = i;
-        while (i < line_len && p[i] != ' ' && p[i] != '\t') i++;
-        size_t tok_len = i - start;
-        argv[idx] = sdsnewlen(p + start, tok_len);
-        if (!argv[idx]) {
-            for (int j = 0; j < idx; j++) sdsfree(argv[j]);
-            free(argv);
-            return -1;                            // OOM，断开
-        }
-        idx++;
-    }
-
-    Command cmd;
-    cmd.argc = argc;
-    cmd.argv = argv;
-    int hrc = handle_command(c, &cmd, store, zset);
-
-    // 释放 argv（无论命令成败都要释放，每个元素是 sds）
-    for (int j = 0; j < argc; j++) sdsfree(argv[j]);
-    free(argv);
-
-    // 游标越过本行（含行结束符）
-    c->qb_pos += (size_t)(line_end - p) + 1;
-    return (hrc == -1) ? -2 : 1;
 }

@@ -21,8 +21,14 @@ RUN   = 200000
 REPS  = 2000000
 TARGET  = mini-redis
 
-# 2. 源文件列表
-SRCS = src/main.c src/server.c src/networking.c src/protocol.c src/commands.c src/storage.c src/sds.c src/anet.c src/dict.c src/skiplist.c src/zset.c src/ae.c
+# 2. 源文件列表（按「变化原因」分组的五个层次）
+#    事件循环层 : ae.c / ae_epoll.c（ae_epoll.c 由 ae.c #include，不单独编译）
+#    网络驱动层 : networking.c（accept/read/write/free + 全局状态 g_server）
+#    连接与监听 : server.c（create_server_socket + Client 生命周期）
+#    响应编码层 : reply.c（send_response + send_*，永不 write）
+#    协议解析层 : parser.c（三层解析器）+ protocol.c（单语法单元）
+#    命令与数据层: commands.c / storage.c / dict.c / skiplist.c / zset.c / sds.c
+SRCS = src/main.c src/server.c src/networking.c src/reply.c src/parser.c src/protocol.c src/commands.c src/storage.c src/sds.c src/anet.c src/dict.c src/skiplist.c src/zset.c src/ae.c
 
 # 3. 将 .c 后缀替换为 .o；.d 是自动生成的依赖文件
 OBJS    = $(SRCS:.c=.o)
@@ -74,8 +80,11 @@ tests/test_lookup_order: tests/test_lookup_order.o src/sds.o
 # 改造阶段 1：ae 事件循环骨架的空跑验证。
 # 独立产物，不动原有 mini-redis —— 便于阶段 0/1 对比。
 # ⚠ 必须链 networking.c：server.c 的 free_client 现在转发到 freeClient。
+#   且必须链 reply.c / parser.c：networking.c 的 readQueryFromClient 要调
+#   processInputBuffer，而解析层里又会调 send_error（编码层）。
+#   这三者的依赖是「网络层 → 解析层 → 编码层」的单向链。
 # 用法：make stage1 && ./mini-redis-stage1
-STAGE1_SRCS = src/main_stage1.c src/ae.c src/anet.c src/server.c src/networking.c src/protocol.c src/sds.c src/commands.c src/storage.c src/dict.c src/skiplist.c src/zset.c
+STAGE1_SRCS = src/main_stage1.c src/ae.c src/anet.c src/server.c src/networking.c src/reply.c src/parser.c src/protocol.c src/sds.c src/commands.c src/storage.c src/dict.c src/skiplist.c src/zset.c
 stage1:
 	$(CC) $(CFLAGS) -o mini-redis-stage1 $(STAGE1_SRCS)
 
