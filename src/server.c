@@ -72,6 +72,14 @@ Client *create_client(int fd){
         free(c);
         return NULL;
     }
+    // ★ 输出缓冲区（非阻塞模型必须）：待发送的数据攒在这里，
+    //   由 beforeSleep / 可写回调调 writeToClient 发出。
+    c->outbuf = sdsempty();
+    if (!c->outbuf) {
+        sdsfree(c->querybuf);
+        free(c);
+        return NULL;
+    }
     c->multibulklen = 0;
     c->bulklen = -1;
     c->cmd_start = 0;
@@ -99,102 +107,124 @@ void free_client(Client *c) {
     freeClient(c);
 }
 
-// 发送 len 字节给客户端（底层唯一执行 write() 循环的发送函数）
-// 循环 write，处理部分写入和 EINTR（信号打断），保证整条响应发完，RESP 协议不截断
-// data 按明确字节长度发送，二进制安全（内容可含 '\0'）
-// ⚠ 前提：main 已把 SIGPIPE 设为 SIG_IGN（P0-1）。否则向已收到 RST 的连接写入时，
-//   SIGPIPE 的默认动作会直接终止进程，本函数下面的错误分支根本没有机会执行。
-void send_response(int client_fd, const void *data, size_t len){
-    if(!data || len == 0) return;
-    const char *p = data;
-    while (len > 0) {
-        ssize_t n = write(client_fd, p, len);
-        // 关于 n == 0 的说明（更正此前过度的说法）：
-        //   在本项目的场景下 write() 返回 0 实际【不可达】—— 发送缓冲区满时，
-        //   阻塞 socket 会在这里阻塞等待，非阻塞 socket 则返回 -1/EAGAIN；
-        //   按 POSIX，count > 0 的成功返回是"实际写入的字节数"，不会是 0。
-        //   所以下面这个分支是【防御性写法】，不是在修一个可复现的 bug。
-        //   仍然保留它，是因为万一真遇到 0，两种处理代价极不对称：
-        //   continue 会变成 100% CPU 的空转死循环，break 只是放弃本次响应。
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;   // 被信号打断，重试
-            break;   // n == 0（防御）或写错误（对端关闭 / EPIPE），放弃本次
-        }
-        p += n;
-        len -= (size_t)n;
+/* ============================================================
+ * 响应发送：入队 + 由事件循环 flush
+ * ============================================================
+ *
+ * ★ 事件循环改造的核心变化 —— 对比改造前后：
+ *
+ *   改造前（阻塞模型）：
+ *     send_response 直接 while 循环 write()，直到整条响应发完才返回。
+ *     「数据还没发出去」这个状态由【内核发送缓冲区】暗中承担，
+ *     代价是：对端读得慢时，本进程会卡在 write 里，整个服务器停摆。
+ *
+ *   改造后（非阻塞事件循环）：
+ *     send_response 只把数据【追加进 c->outbuf】，一次内存拷贝，永不阻塞。
+ *     真正的 write 交给 writeToClient（networking.c），
+ *     由 beforeSleep（以及可写事件回调）驱动。
+ *
+ * ★ 「发送未完成」这个状态从内核转移到了我们自己手上 —— 载体就是 outbuf。
+ *   这是非阻塞 IO 必须付的代价（也是必须做的事）：非阻塞 write 可能只发出
+ *   去一部分（n < len）或完全发不出去（EAGAIN），剩余部分不存起来就是
+ *   「发送半包」，客户端会一直等后半条 RESP 回复。
+ *
+ * ★ 为什么「攒进缓冲」在改造后反而更快：
+ *   改造前一条 +OK 要 3 次 write（"+"/"OK"/"\r\n"）≈ 3 次系统调用；
+ *   现在 3 次 sdscatlen（内存操作）攒成 1 次 write。
+ */
+
+// 追加 len 字节到客户端的输出缓冲。
+// ★ 参数是 Client*（不是 fd）—— 因为要访问 c->outbuf。fd 在 c->fd 里。
+// ★ 本函数【不】执行 write，所以永远不阻塞、也不会失败（除 OOM）。
+void send_response(Client *c, const void *data, size_t len){
+    if (!c || !data || len == 0) return;
+
+    /* sds 是二进制安全的（带长度），所以数据里的 '\0' 不会截断 */
+    sds nb = sdscatlen(c->outbuf, data, len);
+    if (!nb) {
+        /* OOM：outbuf 保持原样（sdscatlen 失败不释放旧 sds）。
+         * 这里只能放弃本次追加 —— 不 freeClient，因为调用方（命令层）
+         * 可能还在用它，而且丢掉一条回复比断开连接更温和。
+         * ★ 注意：调用方无法感知这个失败（签名是 void），这是当前的局限；
+         *   Redis 会用 addReplyError 之类显式处理 OOM。 */
+        fprintf(stderr, "[fd=%d] 输出缓冲扩容失败，丢弃 %zu 字节\n", c->fd, len);
+        return;
     }
+    c->outbuf = nb;
 }
 
 // ==================== RESP 编码 / 发送辅助函数 ====================
-// 每个函数把一种 RESP 数据类型“分段发送”封装成一步，命令层只调这些 API。
-// 统一思路：不像 Redis 那样攒进输出缓冲（它们是非阻塞事件循环，必须缓冲续写；
-// 我们阻塞式单线程，一次调用就能把整条响应写完），而是把 RESP 拆成
-// 前缀/内容/后缀几段，逐段 send_response 直接写出：
-//   - 固定字面量（":"、"$"、"\r\n" 等）直接发；
-//   - 长度不定的字符串（s / msg / val 数据）按 strlen/sdslen 按长度发，绝不 %s；
-//   - 数字只用一个“数学上有上界”的小临时数组装 ASCII（long/size_t 十进制
+// 每个函数把一种 RESP 数据类型「拼接」封装成一步，命令层只调这些 API。
+//
+// 统一思路：把 RESP 拆成前缀/内容/后缀几段，逐段 send_response 追加进 outbuf：
+//   - 固定字面量（":"、"$"、"\r\n" 等）直接追加；
+//   - 长度不定的字符串（s / msg / val 数据）按 strlen/sdslen 按长度追加，绝不 %s；
+//   - 数字只用一个“数学上有界”的小临时数组装 ASCII（long/size_t 十进制
 //     最多 20 位 + 符号，24 字节足够），不存在“长度未知的固定数组”截断隐患。
-// 这样既规避了不定长固定数组，又省掉了“临时建一块 sds 再释放”的开销。
+//
+// ★ 改造后这些函数仍然「分段追加」——但分段本身不再有代价了：
+//   每个分片只是 sdscatlen 到同一块 sds，最后由 writeToClient 一次性发出。
+//   改造前它们是 3 次系统调用，现在是 1 次。
 
 // 简单字符串  +<s>\r\n：分三段  "+"  s  "\r\n"
-void send_simple_string(int client_fd, const char *s){
+void send_simple_string(Client *c, const char *s){
     if(!s) return;
-    send_response(client_fd, "+", 1);
-    send_response(client_fd, s, strlen(s));   // s 长度任意，按长度发
-    send_response(client_fd, "\r\n", 2);
+    send_response(c, "+", 1);
+    send_response(c, s, strlen(s));   // s 长度任意，按长度发
+    send_response(c, "\r\n", 2);
 }
 
 // 错误  -<msg>\r\n：分三段  "-"  msg  "\r\n"
-void send_error(int client_fd, const char *msg){
+void send_error(Client *c, const char *msg){
     if(!msg) return;
-    send_response(client_fd, "-", 1);
-    send_response(client_fd, msg, strlen(msg));   // msg 长度任意，按长度发
-    send_response(client_fd, "\r\n", 2);
+    send_response(c, "-", 1);
+    send_response(c, msg, strlen(msg));   // msg 长度任意，按长度发
+    send_response(c, "\r\n", 2);
 }
 
 // 整数  :<n>\r\n：n 是 long，十进制位数数学上有界（≤20 位），小数组足够
-void send_integer(int client_fd, long n){
+void send_integer(Client *c, long n){
     char num[24];
     int len = snprintf(num, sizeof(num), ":%ld\r\n", n);
-    send_response(client_fd, num, (size_t)len);
+    send_response(c, num, (size_t)len);
 }
 
 // 批量字符串（按明确长度）：$<len>\r\n + <data> + \r\n，二进制安全
-// len 是 size_t，十进制位数数学上有界（≤20 位），片段依次发送
-void send_bulk_string_len(int client_fd, const void *data, size_t len){
+// len 是 size_t，十进制位数数学上有界（≤20 位），片段依次追加
+void send_bulk_string_len(Client *c, const void *data, size_t len){
     char hdr[24];
     int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
-    send_response(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
-    send_response(client_fd, data, len);         // 数据（按长度，二进制安全）
-    send_response(client_fd, "\r\n", 2);         // 尾部
+    send_response(c, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
+    send_response(c, data, len);         // 数据（按长度，二进制安全）
+    send_response(c, "\r\n", 2);         // 尾部
 }
 
 // 批量字符串（sds 版）：val == NULL → $-1\r\n，否则按 sdslen 发完整数据
-void send_bulk_string(int client_fd, sds val){
+void send_bulk_string(Client *c, sds val){
     if(!val){
-        send_null_bulk(client_fd);
+        send_null_bulk(c);
         return;
     }
     char hdr[24];
     size_t len = sdslen(val);
     int hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", len);
-    send_response(client_fd, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
-    send_response(client_fd, val, len);          // 数据（按长度，二进制安全）
-    send_response(client_fd, "\r\n", 2);         // 尾部
+    send_response(c, hdr, (size_t)hl);   // 长度行（纯文本，无 \0）
+    send_response(c, val, len);          // 数据（按长度，二进制安全）
+    send_response(c, "\r\n", 2);         // 尾部
 }
 
 // 空批量字符串  $-1\r\n  （注意：$-1\r\n 只有 5 字节，发送长度传 5，
 //                         若误传 strlen("$-1\r\n")=6 会把结尾 '\0' 也发出去，
 //                         在回复流里多播一个 NUL 字节，破坏二进制精确客户端）
-void send_null_bulk(int client_fd){
-    send_response(client_fd, "$-1\r\n", 5);
+void send_null_bulk(Client *c){
+    send_response(c, "$-1\r\n", 5);
 }
 
 // 数组头  *<n>\r\n：n 是 long，十进制位数数学上有界（≤20 位），小数组足够
-void send_array_len(int client_fd, long n){
+void send_array_len(Client *c, long n){
     char num[24];
     int len = snprintf(num, sizeof(num), "*%ld\r\n", n);
-    send_response(client_fd, num, (size_t)len);
+    send_response(c, num, (size_t)len);
 }
 
 /*
@@ -303,7 +333,7 @@ int processInputBuffer(Client *c,Storage *store, ZSet *zset){
             break;
         }else if(rc == -1){
             // 协议错误，发送错误并断开/清空缓冲区
-            send_error(c->fd, "ERR protocol error");
+            send_error(c, "ERR protocol error");
             return -1;
         }else if(rc == -2){
             // 命令层要求断开（如 OOM），错误响应已在命令层发出，直接断开
@@ -405,7 +435,7 @@ int processMultibulkBuffer(Client *c, Storage *store, ZSet *zset) {
     Command cmd;               // 薄包装：把 argc + argv 提交给命令层（借视图）
     cmd.argc = c->argc;
     cmd.argv = c->argv;
-    int hrc = handle_command(c->fd, &cmd, store, zset);
+    int hrc = handle_command(c, &cmd, store, zset);
 
     // 释放 argv（每个元素是 sds）
     for (int i = 0; i < c->argc; i++) sdsfree(c->argv[i]);
@@ -484,7 +514,7 @@ int processInlineCommand(Client *c, Storage *store, ZSet *zset) {
     Command cmd;
     cmd.argc = argc;
     cmd.argv = argv;
-    int hrc = handle_command(c->fd, &cmd, store, zset);
+    int hrc = handle_command(c, &cmd, store, zset);
 
     // 释放 argv（无论命令成败都要释放，每个元素是 sds）
     for (int j = 0; j < argc; j++) sdsfree(argv[j]);

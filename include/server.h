@@ -40,6 +40,16 @@ typedef struct Client {
     size_t qb_pos;            // 解析游标：已解析数据的进度（相对 querybuf 起点）
                               // 缓冲区有效长度用 sdslen(querybuf) 取，O(1)
 
+    /* ★ 输出缓冲区（事件循环改造新增）——
+     *   非阻塞 write 一旦写不完（EAGAIN），剩余数据必须有个地方存着，
+     *   否则就是「发送半包」：客户端收到半条 RESP 回复，解析器会一直等。
+     *
+     *   ★ 对比改造前：阻塞式 send_response 用 while 循环 write，直到发完
+     *   才返回 —— 数据「还没发出去」这个状态由内核缓冲区暗中承担。
+     *   改成非阻塞后，主动权回到事件循环，这个状态就必须由我们自己显式持有，
+     *   载体就是它。 */
+    sds outbuf;
+
     // 状态机存档变量（对应 Redis processMultibulkBuffer 的状态）
     int cmd_start;
     int multibulklen;   // 剩余待解析的参数个数，0 表示还没解析命令头
@@ -104,24 +114,39 @@ int create_server_socket(int port, int backlog);
 
 /* ============================================================
  * 响应发送（server.c）
- * ============================================================ */
-// 发送响应给客户端：按明确字节长度发送的底层函数（二进制安全，数据可含 '\0'）
-// 唯一执行 write() 循环（处理部分写入 / EINTR）的地方；上层辅助函数全部经由它发出。
-// ★ 阶段 2 仍是阻塞式直接 write；阶段 3 会改成「追加进 outbuf + 由事件循环发送」。
-void send_response(int client_fd, const void *data, size_t len);
+ * ============================================================
+ * ★ 事件循环改造后的核心变化：不再直接 write，而是【追加进 c->outbuf】。
+ *
+ *   为什么：非阻塞 write 可能只发出去一部分（或返回 EAGAIN），
+ *   剩余数据必须存起来等下次「可写」通知 —— 否则就是发送半包。
+ *
+ *   发送时机：由 beforeSleep（和可写事件回调）调 writeToClient 统一 flush。
+ *   放 beforeSleep 的理由：① 攒批（一条 +OK 从 3 次 write 降到 1 次）
+ *   ② 该关闭的谁已确定，不会白写 ③ 写完即可撤掉 EPOLLOUT，epoll_wait 才能睡好。 */
+
+// 追加数据到客户端的输出缓冲（不再执行 write）。
+// ★ 参数从改造前的 int client_fd 换成 Client* —— 因为要访问 c->outbuf。
+//   fd 仍在 c 里（c->fd），真正 write 的是 writeToClient。
+void send_response(Client *c, const void *data, size_t len);
+
+// 把 c->outbuf 里的数据尽力写出去（★ 唯一执行 write() 的地方）。
+// ★ 内部函数（static），只在本文件用：真正执行 write + 处理 EAGAIN。
+//   返回 1 = 已全部发完（并取消可写注册）；0 = 还没发完（已注册可写）；
+//   -1 = 出错（调用方应关闭连接）。
+//   对外的可写事件回调是 writeToClientHandler（匹配 aeFileProc 的 void 返回）。
 
 // ==================== RESP 编码 / 发送辅助函数 ====================
-// 命令层（commands.c）只允许调用下面这些高层 API 来拼接并发送响应，
-// 禁止直接碰 snprintf / send_response 的原始拼接细节——所有“拼接+发送”
-// 逻辑都封装在 server.c 里，全部经由 send_response 发出。
+// 命令层（commands.c）只允许调用下面这些高层 API 来拼接响应，
+// 禁止直接碰 snprintf / write 的原始细节——所有“拼接+发送”逻辑都封装在
+// server.c / networking.c 里，全部经由 send_response 入队。
 // 每个函数只负责一“种” RESP 数据类型，职责单一、可复用。
-void send_simple_string(int client_fd, const char *s);
-void send_error(int client_fd, const char *msg);
-void send_integer(int client_fd, long n);
-void send_bulk_string_len(int client_fd, const void *data, size_t len);
-void send_bulk_string(int client_fd, sds val);
-void send_null_bulk(int client_fd);
-void send_array_len(int client_fd, long n);
+void send_simple_string(Client *c, const char *s);
+void send_error(Client *c, const char *msg);
+void send_integer(Client *c, long n);
+void send_bulk_string_len(Client *c, const void *data, size_t len);
+void send_bulk_string(Client *c, sds val);
+void send_null_bulk(Client *c);
+void send_array_len(Client *c, long n);
 
 /* ============================================================
  * 解析层（server.c）—— 三层解析器，不碰网络

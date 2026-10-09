@@ -166,6 +166,7 @@ int main(int argc, char **argv){
             free(c->argv);
         }
         sdsfree(c->querybuf);
+        sdsfree(c->outbuf);
         free(c);
         c = next;
     }

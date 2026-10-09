@@ -105,14 +105,14 @@ static int format_score(double score, char *buf, size_t bufsz) {
 // 说明：本层只负责“调命令 + 调 RESP 辅助函数拼接/发送响应”，
 //       所有拼接细节（snprintf、按长度发二进制数据）都封装在 server.c 的
 //       send_* 辅助函数里，命令层不直接碰 send_response。
-int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(文件描述符，命令包装，存储引擎，跳表)
+int handle_command(Client *c, Command *cmd, Storage *store, ZSet *zset)  //(文件描述符，命令包装，存储引擎，跳表)
 {
     int argc = cmd->argc;   // 参数个数
     sds *argv = cmd->argv;  // 参数数组（借视图，指向解析器创建的 sds 数组）
 
     //空命令
     if (argc<1){
-        send_error(client_fd, "ERR no command");
+        send_error(c, "ERR no command");
         return 1;
     }
     char *cmd_name =argv[0];    // 命令名，比如 "SET"（sds，当 C 字符串用）
@@ -121,7 +121,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
 
     //PING 命令-检测两台设备之间网络通不通、延迟高不高
     if(strcasecmp(cmd_name,"PING")==0){
-        send_simple_string(client_fd, "PONG");
+        send_simple_string(c, "PONG");
         return 1;
     }
 
@@ -129,7 +129,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
     if(strcasecmp(cmd_name ,"ZADD")==0){
         // 参数格式：ZADD key score member
         if(argc !=4){
-            send_error(client_fd, "ERR wrong number of arguments for 'ZADD'");
+            send_error(c, "ERR wrong number of arguments for 'ZADD'");
             return 1;
         }
 
@@ -145,7 +145,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
             *score_end != '\0' ||          // 数字后跟了垃圾（如 "1.5abc"）
             errno == ERANGE ||             // 溢出 double（Redis 同样按错误处理）
             score != score) {              // NaN（与自身不等），必须拒绝
-            send_error(client_fd, "ERR value is not a valid float");
+            send_error(c, "ERR value is not a valid float");
             return 1;
         }
         // 注：±inf 放行，与 Redis 行为一致（inf 可作合法边界分数）
@@ -156,11 +156,11 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
         // 但失败时必须报错，不能回 +OK（否则是静默数据丢失）。
         if (!zset_add(zset, member, score)) {
             argv[3] = NULL;
-            send_error(client_fd, "ERR out of memory");
+            send_error(c, "ERR out of memory");
             return -1;
         }
         argv[3] = NULL;   // 已被跳表接管所有权，调用方（server.c）不得再 free
-        send_simple_string(client_fd, "OK");
+        send_simple_string(c, "OK");
         return 1;
     }
 
@@ -168,21 +168,21 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
     if(strcasecmp(cmd_name,"ZREM")==0){
         // 参数：ZREM key member
         if(argc !=3){
-            send_error(client_fd, "ERR wrong number of arguments for 'ZREM'");
+            send_error(c, "ERR wrong number of arguments for 'ZREM'");
             return 1;
         }
         sds key=argv[1];
         (void)key;
         sds member=argv[2];
         int result=zset_rem(zset,member);
-        send_integer(client_fd, result);
+        send_integer(c, result);
         return 1;
     }
 
     //ZSCORE命令 指定成员 member 对应的分数（score）
     if(strcasecmp(cmd_name,"ZSCORE")==0){
         if(argc!=3){
-            send_error(client_fd, "ERR wrong number of arguments for 'ZSCORE'");
+            send_error(c, "ERR wrong number of arguments for 'ZSCORE'");
             return 1;
         }
         sds key=argv[1];
@@ -191,11 +191,11 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
         bool found =false;
         double score=zset_score(zset,member,&found);
         if(!found){
-            send_null_bulk(client_fd);   // nil
+            send_null_bulk(c);   // nil
         }else{
             char buf[64];
             int bl = format_score(score, buf, sizeof(buf));   // 分数转文本（%.17g + 裁尾零）
-            send_bulk_string_len(client_fd, buf, (size_t)bl); // 按长度发送
+            send_bulk_string_len(c, buf, (size_t)bl); // 按长度发送
         }
         return 1;
     }
@@ -204,7 +204,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
     if(strcasecmp(cmd_name,"ZRANGE")==0){
         // 参数：ZRANGE key start stop
         if(argc !=4){
-            send_error(client_fd, "ERR wrong number of arguments for 'ZRANGE'");
+            send_error(c, "ERR wrong number of arguments for 'ZRANGE'");
             return 1;
         }
 
@@ -215,14 +215,14 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
         long start_l, stop_l;
         if(!parse_strict_long(argv[2], &start_l) ||
            !parse_strict_long(argv[3], &stop_l)){
-            send_error(client_fd, "ERR value is not an integer or out of range");
+            send_error(c, "ERR value is not an integer or out of range");
             return 1;
         }
         // P1-3 修复：long → int 之前必须校验范围。原先直接强转，超 int 的值会被
         // 静默截断（ZRANGE k 4294967297 -1 会被截成 1），用户拿到毫不相干的结果。
         if (start_l < INT_MIN || start_l > INT_MAX ||
             stop_l  < INT_MIN || stop_l  > INT_MAX) {
-            send_error(client_fd, "ERR value is not an integer or out of range");
+            send_error(c, "ERR value is not an integer or out of range");
             return 1;
         }
         int start =(int)start_l;
@@ -232,7 +232,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
         if(!member){
             // B8 修复：分配失败。响应一个字节都还没发，无协议失步，
             // 但 OOM 下不应继续服务，报错并断开
-            send_error(client_fd, "ERR out of memory");
+            send_error(c, "ERR out of memory");
             return -1;
         }
 
@@ -241,11 +241,11 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
         int count =0;
         while(member[count]) count++;
 
-        send_array_len(client_fd, count);                    // 数组头 *n\r\n
+        send_array_len(c, count);                    // 数组头 *n\r\n
 
         // 逐条发送成员（批量字符串，二进制安全：sdslen 取长 + 按长度发）
         for(int i=0;i<count;i++){
-            send_bulk_string(client_fd, member[i]);          // $len\r\n<data>\r\n
+            send_bulk_string(c, member[i]);          // $len\r\n<data>\r\n
             sdsfree(member[i]);
         }
         free(member);
@@ -256,7 +256,7 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
     //SET命令
     if(strcasecmp(cmd_name,"SET")==0){
         if(argc !=3){
-            send_error(client_fd, "ERR wrong number of arguments for 'SET'");
+            send_error(c, "ERR wrong number of arguments for 'SET'");
             return 1;
         }
         // SET 分支默认走"argv 不释放给哈希"优化（steal 所有权）：
@@ -276,23 +276,23 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
             argv[2] = NULL;
             // 按 B8 约定：此时一个响应字节都还没发出，不存在协议失步；
             // OOM 下不应继续服务，报错并断开连接。
-            send_error(client_fd, "ERR out of memory");
+            send_error(c, "ERR out of memory");
             return -1;
         }
         argv[1] = NULL;   // 已被哈希表接管，调用方（server.c）不得再 free
         argv[2] = NULL;
-        send_simple_string(client_fd, "OK");   // 惯例大写（redis-cli 会原样显示）
+        send_simple_string(c, "OK");   // 惯例大写（redis-cli 会原样显示）
         return 1;
     }
 
     //GET 分支
     else if(strcasecmp(cmd_name,"GET")==0){
         if(argc !=2){
-            send_error(client_fd, "ERR wrong number of arguments for 'GET'");
+            send_error(c, "ERR wrong number of arguments for 'GET'");
             return 1;
         }
         sds val= storage_get(store,argv[1]);
-        send_bulk_string(client_fd, val);   // val==NULL → $-1\r\n；否则按 sdslen 二进制安全发送
+        send_bulk_string(c, val);   // val==NULL → $-1\r\n；否则按 sdslen 二进制安全发送
         sdsfree(val);                       // 方案C：val 是 storage_get 返回的可拥有深拷贝，用完即释放
         return 1;
     }
@@ -300,16 +300,16 @@ int handle_command(int client_fd, Command *cmd, Storage *store, ZSet *zset)  //(
     //DEL 分支
     else if(strcasecmp(cmd_name,"DEL")==0){
         if(argc !=2){
-            send_error(client_fd, "ERR wrong number of arguments for 'DEL'");
+            send_error(c, "ERR wrong number of arguments for 'DEL'");
             return 1;
         }
         int deleted =storage_del(store,argv[1]);
-        send_integer(client_fd, deleted);
+        send_integer(c, deleted);
         return 1;
     }
     //未知命令
     else{
-        send_error(client_fd, "ERR unknown command");
+        send_error(c, "ERR unknown command");
         return 1;
     }
 }

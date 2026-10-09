@@ -39,6 +39,10 @@
  * 包括 stage1 那种自己写 main 的独立产物。 */
 Server g_server;
 
+/* 前向声明：可写事件回调（定义在下方，签名要匹配 aeFileProc）。
+ * writeToClientRaw 注册的就是它。 */
+static void writeToClientHandler(aeEventLoop *el, int fd, void *clientData, int mask);
+
 /* 单次 read 的临时缓冲。★ 注意：它是【栈上的局部变量】，
  * 不是每连接一份 —— 因为非阻塞 read 一次只读一小块，
  * 读完立刻 append 进 querybuf（sds），不需要在两次回调间保留。 */
@@ -110,6 +114,29 @@ static void clients_remove(Client *c) {
 void freeClient(Client *c) {
     if (!c) return;
 
+    /* ★ 第 ⓪ 步（阶段 3 新增）：把 outbuf 里还没发出去的数据尽力写完。
+     *
+     *   为什么必须做：send_response 现在是【入队】而不是直接 write。
+     *   如果关闭前不 flush，像「协议错误 → send_error → 立刻断开」
+     *   这样的路径会把整条错误回复丢掉 —— 客户端什么也收不到。
+     *   （改造前 send_response 是直接 write，所以没这个问题。）
+     *
+     *   这里是【尽力而为】的同步发送：循环 write 直到发完或真的写不动。
+     *   为什么可以在这里阻塞：这是连接的最后时刻，我们马上要关它，
+     *   短暂阻塞不影响别的连接，而且通常一次就写完。
+     *   ⚠ 但对端完全不读时不能无限等 —— 所以 EAGAIN 就放弃剩余数据
+     *     （宁可丢掉尾部，也不能把整个服务器拖住）。 */
+    if (sdslen(c->outbuf) > 0) {
+        size_t sent = 0;
+        size_t total = sdslen(c->outbuf);
+        while (sent < total) {
+            ssize_t n = write(c->fd, c->outbuf + sent, total - sent);
+            if (n > 0) { sent += (size_t)n; continue; }
+            if (n < 0 && errno == EINTR) continue;
+            break;   /* EAGAIN 或写错误：发不完了，放弃剩余部分 */
+        }
+    }
+
     /* ① 撤关注：先读后写，两个都要 */
     if (g_server.el) {
         aeDeleteFileEvent(g_server.el, c->fd, AE_READABLE);
@@ -128,6 +155,7 @@ void freeClient(Client *c) {
         free(c->argv);
     }
     sdsfree(c->querybuf);
+    sdsfree(c->outbuf);
     free(c);
 }
 
@@ -271,17 +299,109 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask) {
 }
 
 /* ============================================================
+ * writeToClient —— ★ 唯一执行 write() 的地方
+ * ============================================================
+ * 把 c->outbuf 里的数据尽力写出去。三条规则缺一不可：
+ *
+ *   ① 部分成功（0 < n < len）→ 消费掉已写出的部分，【继续循环】
+ *      因为刚刚成功了，说明内核缓冲区还有空间，再试一次很可能仍有收益。
+ *
+ *   ② EAGAIN → ★ 立刻返回，绝不重试
+ *      内核缓冲区现在是满的，重试 1000 次结果完全一样（它不会因为你
+ *      重试而腾出空间，只会因为对端读了才腾出）。必须：
+ *        · 注册 AE_WRITABLE，让内核在「有空间」时通知我们
+ *        · 立刻把控制权交回事件循环（去服务别的 fd）
+ *
+ *   ③ outbuf 空了 → ★ 必须取消 AE_WRITABLE
+ *      否则 epoll_wait 会【疯狂】返回「可写」（socket 大多数时候都可写）
+ *      → 回调被反复调用 → 什么都不做 → 100% CPU 空转。
+ *      这是 epoll 编程最经典的性能陷阱，而且不报任何错。
+ *
+ * 返回值：1 = 发完（已取消可写注册）；0 = 没发完（已注册可写）；-1 = 出错。
+ *
+ * ★ 签名必须匹配 aeFileProc —— 因为它自己会被注册为 wfileProc：
+ *     writeToClient(loop, fd, clientData, mask)
+ *   这是「自己注册自己」的递归结构：写不完 → 注册可写 → 内核通知 →
+ *   再调本函数 → 继续写。 */
+/* 内部实现：真正干活，返回 1/0/-1（调用方需要区分「发完」和「没发完」） */
+static int writeToClientRaw(Client *c) {
+    if (!c) return -1;
+
+    while (sdslen(c->outbuf) > 0) {
+        size_t remaining = sdslen(c->outbuf);
+        ssize_t n = write(c->fd, c->outbuf, remaining);
+
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* ② 内核满了 → 注册可写，等通知。★ 不重试、不忙等 */
+                if (aeCreateFileEvent(g_server.el, c->fd, AE_WRITABLE,
+                                      writeToClientHandler, c) == AE_ERR) {
+                    return -1;      /* 注册不上（fd 越界/OOM），让调用方关闭 */
+                }
+                return 0;
+            }
+            if (errno == EINTR) continue;   /* 被信号打断，重试这次 write */
+            /* EPIPE / ECONNRESET 等：对端已关闭 → 让调用方 freeClient */
+            return -1;
+        }
+
+        if (n == 0) {
+            /* 防御性写法：按 POSIX，count > 0 时成功返回不会是 0。
+             * 万一真遇到，continue 会变成空转死循环，所以按「发不出去」处理。 */
+            return -1;
+        }
+
+        /* ① 部分或全部写出 → 消费掉已发出的部分 */
+        sdsrange(c->outbuf, n, -1);
+    }
+
+    /* ③ outbuf 空了 → ★ 必须取消可写通知，否则 epoll_wait 会忙转 */
+    aeDeleteFileEvent(g_server.el, c->fd, AE_WRITABLE);
+    return 1;
+}
+
+/* 可写事件回调包装：aeFileProc 返回 void，而内部实现要返回状态码，
+ * 所以包一层。★ 这就是「回调签名的适配层」。 */
+static void writeToClientHandler(aeEventLoop *el, int fd, void *clientData, int mask) {
+    (void)el; (void)fd; (void)mask;
+    Client *c = (Client *)clientData;
+    if (!c) return;
+    if (writeToClientRaw(c) == -1) {
+        /* 写错误 → 关闭。注意：此刻我们是在事件分发循环【内部】，
+         * freeClient 会把 mask 清成 AE_NONE，分发循环会自动跳过它。 */
+        freeClient(c);
+    }
+}
+
+/* ============================================================
  * beforeSleep —— 本轮收尾（睡之前）
  * ============================================================
  * ★ 放这里而不是「命令执行完立刻写」，三个理由：
- *   ① 攒批：一条 +OK 的 3 段 write 合成 1 次系统调用
+ *   ① 攒批：一条 +OK 从 3 次 write 降到 1 次（改造前是 3 次系统调用）
  *   ② 谁要关闭已确定 → 不会白写
  *   ③ 写完即可撤掉 EPOLLOUT → epoll_wait 才能睡好
  *      （EPOLLOUT 几乎总是就绪，留着它 epoll_wait 会立刻返回 = 忙转）
  *
- * ★ 阶段 3 会在这里实现：遍历 clients，把 outbuf 里的数据 write 出去。
- *   阶段 2 还没引入 outbuf（send_response 仍是阻塞直写），所以这里是占位。 */
+ * ★ 遍历时的陷阱：writeToClient 可能因为写错误而 freeClient(c)，
+ *   那样 c 这个节点就被摘掉了 —— 后续 c->next 就是 use-after-free。
+ *   所以【先存 next 再处理】（下面 x 变量就是这么做的）。
+ *
+ *   ⚠ 更稳的做法是「先收集要关闭的，遍历完再统一关」（惰性删除思路）。
+ *     当前的「先存 next」在 writeToClient 只释放【自己】的前提下是安全的：
+ *     它不会去释放别的 Client。 */
 void beforeSleep(aeEventLoop *el) {
     (void)el;
-    /* 阶段 3: 遍历 g_server.clients，处理各自 outbuf */
+    if (!g_server.el) return;
+
+    Client *c = g_server.clients;
+    while (c) {
+        Client *next = c->next;      /* ★ 先存，因为 c 可能被释放 */
+
+        if (sdslen(c->outbuf) > 0) {
+            if (writeToClientRaw(c) == -1) {
+                freeClient(c);        /* 写错误 → 关闭（c 已摘出链表） */
+            }
+        }
+        c = next;
+    }
 }
