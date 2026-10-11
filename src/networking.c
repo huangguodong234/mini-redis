@@ -473,26 +473,45 @@ int serverCron(aeEventLoop *el, long long id, void *clientData) {
          *   ★ 这就把「一次大停顿」摊成了「每次小停顿」——
          *     和渐进式 rehash 是同一个思想（把 O(n) 摊成 O(1)/轮）。
          *
-         *   ⚠ 这里的 cursor 用静态变量保存「上次检查到哪了」。
-         *     缺点是它对「客户端被删」不敏感（游标可能跳过几个），
-         *     所以下面加了「至少检查 1 个」的保底。 */
-        static Client *cursor = NULL;
+         *   ★ 分批的做法：只检查「空闲时长落在本片区间」的客户端，
+         *     分片号每轮轮转。于是每个客户端仍能在大约 1 秒内被检查一次，
+         *     而轮转状态只是一个整数（cronloops % slices）—— 不持有任何
+         *     对象地址。
+         *
+         *   ⚠️ 这里【绝不能用】「保存上次扫描到的 Client* 当游标」。
+         *     那个节点随时可能在两次 serverCron 之间被 freeClient 释放
+         *     （对端断开、协议错误…），游标就成了悬垂指针 ——
+         *     下一轮解引用即 heap-use-after-free。
+         *     ★ 这不是假设：本项目最初就是这么写的，被 ASan 抓到
+         *       serverCron 读取已释放的 Client（见 git 历史里的阶段4修复）。
+         *     教训：分批游标要存【可重算的标量】（下标/时间），
+         *           不要存【对象地址】—— 地址的生命周期不受你控制。 */
+        int slices = (g_server.hz > 0) ? g_server.hz : 1;
+        int slice  = (int)(g_server.cronloops % slices);
+        long long slice_ms = limit_ms / slices;
+        if (slice_ms < 1) slice_ms = 1;
 
-        int iterations = g_server.numclients / (g_server.hz > 0 ? g_server.hz : 1);
-        if (iterations < 1) iterations = 1;   /* ★ 保底：至少检查一个 */
-
-        Client *c = cursor ? cursor : g_server.clients;
-        while (iterations-- > 0 && c) {
+        /* ★ 遍历只用 c / next 两个局部指针 —— c 一定是本轮链表里的活节点，
+         *   所以 c->next 永远安全（前面每次 freeClient 前都先存了 next）。 */
+        Client *c = g_server.clients;
+        while (c) {
             Client *next = c->next;          /* ★ 先存：c 可能被踢掉 */
+            long long idle = now - c->lastinteraction;
 
-            if (now - c->lastinteraction > limit_ms) {
-                printf("[fd=%d] 空闲超过 %d 秒，断开\n", c->fd, g_server.maxidletime);
+            /* 本片区间 [slice*slice_ms, (slice+1)*slice_ms)。
+             * ★ 最后一片【不设上界】—— 否则空闲远超 limit_ms 的客户端
+             *   会落在所有分片之外，永远不被检查、永远踢不掉。 */
+            int in_slice = (slice == slices - 1)
+                         ? (idle >= slice_ms * slice)
+                         : (idle >= slice_ms * slice && idle < slice_ms * (slice + 1));
+
+            if (in_slice && idle > limit_ms) {
+                printf("[fd=%d] 空闲 %lld 秒，超过上限 %d 秒，断开\n",
+                       c->fd, idle / 1000, g_server.maxidletime);
                 freeClient(el, c);
             }
             c = next;
         }
-        /* 记下游标；扫到末尾就从头再来 */
-        cursor = c ? c : g_server.clients;
     }
 
     /* 下次还是 1000/hz 毫秒之后（动态计算，避免误差累积） */

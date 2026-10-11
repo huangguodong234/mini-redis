@@ -507,6 +507,69 @@ PYEOF
 }
 assert_eq "空闲超时：空闲连接被踢、活跃连接不受影响（定时器回归）" "OK" "$(py_idle_timeout_probe)"
 
+# 8.3b 分批游标不能持有 Client*（阶段 4 修复回归）：
+#      serverCron 的分批检查如果「保存上次扫描到的 Client* 当游标」，
+#      那个节点可能在两次 cron 之间被 freeClient 释放 → 下一轮解引用即
+#      heap-use-after-free。这个 bug 真实发生过（ASan 抓到 serverCron
+#      读取已释放的 Client），修复是改成不持有任何对象地址。
+#      这里用「反复建立/断开一批连接」来踩它：连接被删得越频繁，
+#      游标指向已释放节点的概率越高。
+#      ⚠ 这一项在普通构建下可能【侥幸通过】（释放的内存往往还能读）——
+#        它真正的检出能力在 `make asan` 之后跑。但仍然值得保留：
+#        崩溃/异常退出在普通构建下也会被抓到。
+py_cron_uaf_probe() {
+    python3 - <<'PYEOF'
+import os, socket, subprocess, time
+host = os.environ.get('HOST', '127.0.0.1')
+port = int(os.environ.get('UAF_PORT', '6398'))
+
+# CLIENT_TIMEOUT 用一个大值：我们不想踢连接，只想让分批扫描持续运行
+srv = subprocess.Popen(['./mini-redis', str(port)],
+                       env={**os.environ, 'CLIENT_TIMEOUT': '60'},
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    for _ in range(50):
+        try:
+            t = socket.create_connection((host, port), 0.2); t.close(); break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        print("SERVER_NOT_UP"); raise SystemExit
+
+    rounds = 0
+    for _ in range(8):
+        conns = [socket.create_connection((host, port), 3) for _ in range(8)]
+        for c in conns:
+            c.sendall(b"*1\r\n$4\r\nPING\r\n")
+        for c in conns:
+            c.recv(64)
+        time.sleep(0.35)      # 期间 serverCron 会跑几轮（分批扫描进行中）
+        for c in conns:
+            c.close()         # 全部断开 —— 游标若存指针就会指向已释放节点
+        time.sleep(0.4)
+        rounds += 1
+
+    # 服务器必须仍然存活、仍能服务
+    alive = False
+    try:
+        s = socket.create_connection((host, port), 3)
+        s.sendall(b"*1\r\n$4\r\nPING\r\n")
+        alive = (s.recv(64) == b"+PONG\r\n")
+        s.close()
+    except OSError:
+        pass
+
+    rc = srv.poll()           # 非 None 表示服务器已经自己崩了
+    print("OK" if (alive and rc is None) else
+          "alive=%s exitcode=%s rounds=%d" % (alive, rc, rounds))
+finally:
+    srv.terminate()
+    try: srv.wait(timeout=5)
+    except subprocess.TimeoutExpired: srv.kill()
+PYEOF
+}
+assert_eq "定时器分批扫描：频繁断开不导致悬垂游标（阶段4 UAF 回归）" "OK" "$(py_cron_uaf_probe)"
+
 # 8.4 优雅退出回归（P0-2）：有客户端连接着时发 SIGINT，服务器必须能退出。
 #     修复前：readQueryFromClient 的 EINTR 分支无条件 continue，
 #             只要还有客户端连着，Ctrl+C 就永远退不出去（只能等客户端断开）。
