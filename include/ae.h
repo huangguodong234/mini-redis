@@ -28,9 +28,10 @@
  *        · 合并后的新掩码是什么（mask |= 旧掩码）
  *        · 分发时该不该调回调（fe->mask & fired_mask & AE_XXX）
  *
- * ★ 本文件当前【不含定时器】。定时器（时间事件）留到改造阶段 4，
- *   届时再加 aeTimeEvent / aeCreateTimeEvent / processTimeEvents。
- *   先做文件事件，分而治之。
+ * ★ 定时器（时间事件）—— 阶段 4 已加入（无序双向链表 + O(n) 扫描）。
+ *   数据结构是【无序双向链表 + O(n) 扫描】，和 Redis 一致。
+ *   为什么不用最小堆：本项目只有 1~2 个定时器，堆的维护成本反而更高。
+ *   详见下方 aeTimeEvent 的说明。
  */
 
 #define AE_OK 0
@@ -57,6 +58,50 @@ typedef void aeFileProc(aeEventLoop *eventLoop, int fd, void *clientData, int ma
 
 /* 睡眠前/后的钩子（控制反转：ae 留空位，上层填自己的逻辑） */
 typedef void aeBeforeSleepProc(aeEventLoop *eventLoop);
+
+/* ============================================================
+ * 定时器（时间事件 / 时间事件）
+ * ============================================================
+ * ★ 与文件事件的根本不同：
+ *     文件事件 = 内核告诉我们「什么时候发生了什么」
+ *     时间事件 = 我们自己算出「什么时候该做什么」
+ *   所以文件事件靠 epoll_wait 出参驱动，时间事件靠 epoll_wait 的
+ *   【timeout 参数】驱动 —— 把超时设成「距最近定时器还有多久」，
+ *   睡到那个点自然醒来处理。这就是定时器与事件循环的结合方式。
+ *
+ * ★ 数据结构为什么是无序双向链表 + O(n) 扫描（同 Redis）：
+ *     · 本项目只有 1~2 个定时器（serverCron 是唯一入口，它内部
+ *       分发很多子任务，而不是注册很多定时器）
+ *     · 2 个元素下，最小堆的维护成本 > 扫一遍的成本
+ *     · ★ 关键前提：定时器数量【不随连接数增长】。
+ *       如果「每个客户端一个超时定时器」，那 10000 连接 = 10000 定时器，
+ *       O(n) 扫描就不可接受了 —— 那种设计必须换结构。
+ *       本项目用【轮询】解决客户端空闲超时（见 serverCron），
+ *       所以定时器数量恒定，链表足够。
+ *
+ * ★ 回调返回值是「下次什么时候再执行」（毫秒）：
+ *     · 返回 > 0 → 相对当前时间再过这么多毫秒再执行
+ *     · 返回 AE_NOMORE (-1) → 只执行这一次，然后把这个定时器删掉
+ *   ⚠ 这个约定来自 Redis。它让定时器自己决定「一次性」还是「周期性」，
+ *     ae 层不必知道语义差异。
+ */
+#define AE_NOMORE -1
+
+typedef int aeTimeProc(aeEventLoop *eventLoop, long long id, void *clientData);
+
+/* 每个定时器一个这个结构体（链表节点 + 元信息） */
+typedef struct aeTimeEvent {
+    long long id;                  /* 定时器编号，全局自增，用于标注和删除 */
+    long long when;                /* ★ 绝对到期时刻（毫秒，typeof(unixtime in ms)）。
+                                    * 为什么存绝对时间而不是「间隔」：
+                                    *   醒来时要判断「到期了没」= now >= when；
+                                    *   存间隔的话每次都得记住「上次啥时候跑的」。 */
+    aeTimeProc *timeProc;          /* 到期时调这个 */
+    void *clientData;              /* 上层数据（ae 只存不解释，同文件事件的 clientData） */
+    struct aeTimeEvent *prev;      /* ★ 无序双向链表 —— 双向是为了 O(1) 摘除
+                                    *   （和 Client 链表同一个理由：删除时要找前驱） */
+    struct aeTimeEvent *next;
+} aeTimeEvent;
 
 /* 每个 fd 的事件处理器 —— events[fd] 就是它
  * 实测（gcc -O2, x86-64）sizeof == 32：3 个指针(24) + int(4) + 4 字节 padding。
@@ -160,6 +205,13 @@ struct aeEventLoop {
   
     aeBeforeSleepProc *beforesleep;  /* 睡【之前】的钩子（控制反转）。见下方说明。 */
     aeBeforeSleepProc *aftersleep;   /* 睡【之后】的钩子。见下方说明。 */
+
+    /* ---- 定时器 ---- */
+    aeTimeEvent *timeEventHead;      /* ★ 定时器链表头（无序）。NULL = 没有定时器。
+                                      * 没有定时器时 epoll_wait 的 timeout 传 -1
+                                      * （无限等待）—— 这正是阶段 3 之前的行为。 */
+    long long timeEventNextId;       /* 下一个要分配的定时器 id（只增不减） */
+
     int flags;               /* 全局标志位，目前只有 AE_DONT_WAIT（= 本次不睡）。
                               * 与 aeProcessEvents 的 flags 参数是【两层】：
                               *   参数 = 调用点说「这次别睡」（单次，优先级更高）
@@ -209,6 +261,24 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
 void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask);
 int aeGetFileEvents(aeEventLoop *eventLoop, int fd);
 void *aeGetFileClientData(aeEventLoop *eventLoop, int fd);
+
+/* ---------- 时间事件（定时器） ----------
+ * aeCreateTimeEvent(el, 毫秒, proc, clientData)：
+ *   注册一个「再过 ms 毫秒执行」的定时器，返回它的 id（>0），失败返回 AE_ERR。
+ *   ★ proc 的返回值决定后续行为：>0 表示「再过这么多毫秒再来」，
+ *     AE_NOMORE 表示「只跑这一次，跑完删掉」。
+ * aeDeleteTimeEvent(el, id)：按 id 删除。返回 AE_OK / AE_ERR（没找到）。
+ * aeGetTimeEventsCount(el)：当前定时器数量（测试/调试用）。
+ */
+long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
+                            aeTimeProc *proc, void *clientData);
+int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id);
+int aeGetTimeEventsCount(aeEventLoop *eventLoop);
+
+/* 当前时间（毫秒）。★ 上层也用它给「最后一次活动」打时间戳
+ * （如 Client.lastinteraction），这样全项目只有一个时间来源，
+ * 不会出现「两处取时间、精度/基准不一致」的问题。 */
+long long aeGetTimeMilliseconds(void);
 
 /* ---------- 主循环 ---------- */
 int aeProcessEvents(aeEventLoop *eventLoop, int flags);

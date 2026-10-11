@@ -63,6 +63,20 @@ typedef struct Client {
     /* ---- 链表指针（把所有客户端串起来） ---- */
     struct Client *next;
     struct Client *prev;
+
+    /* ★ 最后一次产生「可观测活动」的时刻（毫秒，来自 aeGetTimeMilliseconds）。
+     *   用于空闲超时检测（serverCron 里轮询）。
+     *
+     *   ★ 为什么用【轮询】而不是「每个客户端一个定时器」：
+     *     后者在 10000 连接时会产生 10000 个定时器，ae 的 O(n) 扫描
+     *     就变成 O(10000)/轮 —— 而定时器本该只有 1~2 个。
+     *     轮询把成本从「定时器数量」转回了「客户端数量」，
+     *     而遍历客户端本来就是必须的（beforeSleep 每轮都在做）。
+     *
+     *   ★ 语义：只在【读到客户端数据】时更新。
+     *     所以「连上但不发任何命令」的连接会被踢 —— 这正是想要的
+     *     （防住只占 fd 不发数据的连接）。 */
+    long long lastinteraction;
 } Client;
 
 /* ============================================================
@@ -93,9 +107,31 @@ typedef struct {
     ZSet *zset;
     Client *clients;      // 客户端双向链表头
     int numclients;       // 当前连接数（用于 maxclients 检查）
+
+    /* ---- 定时任务配置（阶段 4 新增） ---- */
+    int hz;               /* serverCron 每秒跑多少次（Redis 默认 10，即每 100ms） */
+    int maxidletime;      /* 客户端空闲多少秒后被踢掉（0 = 不检查超时） */
+    long long cronloops;  /* serverCron 已经跑过多少轮（调试/统计用） */
 } Server;
 
 extern Server g_server;
+
+/* ============================================================
+ * 定时任务（networking.c）
+ * ============================================================
+ * ★ serverCron —— 所有周期性工作的【唯一入口】。
+ *
+ *   ★ 为什么是「一个定时器 + 内部分发」而不是「多个定时器」：
+ *     Redis 的做法就是一个 serverCron，内部依次检查各种条件
+ *     （AOF、主从、clientsCron、内存整理……），每个子任务有自己的
+ *     频率计数器（每 N 轮跑一次）。
+ *     这样定时器链表永远是 O(1) 个节点，扫描成本恒定。
+ *
+ *   本项目它做两件事：
+ *     ① 检查客户端空闲超时（分批，见实现注释）
+ *     ② 维护 cronloops 计数
+ */
+int serverCron(aeEventLoop *el, long long id, void *clientData);
 
 /* ============================================================
  * 网络驱动层（src/networking.c）

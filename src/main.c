@@ -128,10 +128,32 @@ int main(int argc, char **argv){
     g_server.zset = global_zset;
     g_server.clients = NULL;
     g_server.numclients = 0;
+    /* ★ 定时任务配置（阶段 4）：hz=10 表示 serverCron 每 100ms 跑一次。
+     *   maxidletime 从环境变量 CLIENT_TIMEOUT 读，默认 0 = 不检查超时
+     *   （这样默认行为和阶段 3 完全一致，回归测试不会因为超时被踢而失败）。 */
+    g_server.hz = 10;
+    g_server.cronloops = 0;
+    {
+        const char *tmo = getenv("CLIENT_TIMEOUT");
+        int t = (tmo && *tmo) ? atoi(tmo) : 0;
+        g_server.maxidletime = (t > 0) ? t : 0;
+    }
     g_el = el;
 
     /* ★ 注册 beforesleep：睡之前的收尾（阶段 3 在这里 flush 各客户端 outbuf） */
     aeSetBeforeSleepProc(el, beforeSleep);
+
+    /* ★ 注册 serverCron 定时器（阶段 4）—— 所有周期任务的唯一入口。
+     *   第一次在 100ms 后触发，之后自己返回下次间隔（1000/hz 毫秒）。
+     *   ★ 这一个定时器让 epoll_wait 不再「无限睡眠」：超时会按它算。 */
+    if (aeCreateTimeEvent(el, 1000 / g_server.hz, serverCron, NULL) == AE_ERR) {
+        fprintf(stderr, "注册 serverCron 失败\n");
+        aeDeleteEventLoop(el);
+        close(server_fd);
+        zset_free(global_zset);
+        storage_free(store);
+        return EXIT_FAILURE;
+    }
 
     /* ★ 把 listen fd 注册进事件循环 —— 它可读就表示「有新连接」。
      *   clientData 传 NULL（listen fd 没有对应的 Client）。 */

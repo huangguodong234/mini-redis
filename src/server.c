@@ -78,6 +78,10 @@ Client *create_client(int fd){
      *   acceptTcpHandler 调 clients_add 完成（在 create_client 之后）。 */
     c->next = NULL;
     c->prev = NULL;
+    /* ★ 空闲计时从「建立连接的那一刻」开始 —— 这样「连上但不发数据」
+     *   的连接也会被超时机制覆盖。
+     *   （若留 0，它在超时检查里会被算成「空闲了 50 年」立刻踢掉 —— 那是另一种 bug。） */
+    c->lastinteraction = aeGetTimeMilliseconds();
 
     return c;
 }

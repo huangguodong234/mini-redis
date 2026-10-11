@@ -217,7 +217,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask) {
          *        多一次系统调用。换来的是判断总是基于真实计数，绝不误判。
          *      · 拒绝方式：直接 close 会让客户端收到 RST（或空回复），
          *        更好的做法是先回一条 "-ERR max number of clients reached"
-         *        再关（Redis 就这么做）—— 留待阶段 4。
+         *        再关（Redis 就这么做）—— ★ 本项目【未实现】，属已知局限。
          *    Redis 在 acceptTcpHandler 里也是 accept 之后再查 maxclients。 */
         if (g_server.numclients >= MAX_CLIENTS) {
             fprintf(stderr, "连接数已达上限 %d，拒绝 fd=%d\n", MAX_CLIENTS, cfd);
@@ -271,6 +271,12 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask) {
     ssize_t n = read(fd, buf, sizeof(buf));
 
     if (n > 0) {
+        /* ★ 更新空闲计时：客户端确实发东西来了。
+         *   放在最前面 —— 只要读到了数据，无论后面解析成败都算这次活动。
+         *   （否则「一直发非法命令」的连接会被误判为空闲，
+         *     而它其实很活跃，只是内容不对 —— 那该由协议错误路径处理。） */
+        c->lastinteraction = aeGetTimeMilliseconds();
+
         /* 防御：请求缓冲不能无限增长（恶意客户端只发不解析） */
         if (sdslen(c->querybuf) + (size_t)n > MAX_QUERYBUF) {
             fprintf(stderr, "[fd=%d] 请求缓冲超限，断开\n", fd);
@@ -429,4 +435,66 @@ void beforeSleep(aeEventLoop *el) {
         }
         c = next;
     }
+}
+
+/* ============================================================
+ * serverCron —— 周期性任务的唯一入口
+ * ============================================================
+ * 由 ae 层每 1000/hz 毫秒回调一次（本项目 hz=10 → 每 100ms）。
+ *
+ * ★ 返回值是「下次什么时候再来」（毫秒），不是「间隔」——
+ *   ae 会把它换算成新的绝对到期时刻。
+ *   ★ 每次返回【动态计算】而不是固定值：这样即使某一轮跑得慢了，
+ *     也不会把延迟累积下去（每次都是「从现在起 100ms 后」）。
+ *
+ * ★ 本函数当前做一件事：清理空闲超时的客户端。
+ *   以后可以在这里加：渐进式 rehash 的推进、内存统计、日志轮转等。
+ *   ★ 关键是【所有周期工作共用一个定时器】—— 定时器链表恒定只有
+ *     1~2 个节点，ae 的 O(n) 扫描才成立。
+ */
+int serverCron(aeEventLoop *el, long long id, void *clientData) {
+    (void)id; (void)clientData;
+    g_server.cronloops++;
+
+    /* ---------- 客户端空闲超时检查 ---------- */
+    if (g_server.maxidletime > 0 && g_server.numclients > 0) {
+        long long now = aeGetTimeMilliseconds();
+        long long limit_ms = (long long)g_server.maxidletime * 1000;
+
+        /* ★ 分批（每轮只检查一部分），而不是一次性扫完所有客户端。
+         *
+         *   为什么：10000 个客户端时，一轮扫完要 10000 次比较 ——
+         *   虽然单次很便宜，但它会让【这一轮】的延迟变大，
+         *   而 serverCron 每 100ms 就要跑一次。
+         *
+         *   iterations = numclients / hz 是 Redis 的算法：
+         *     hz=10（每 100ms 一轮）→ 每轮检查 1/10 的客户端
+         *     → 理论上每个客户端 1 秒内至少被检查一次
+         *   ★ 这就把「一次大停顿」摊成了「每次小停顿」——
+         *     和渐进式 rehash 是同一个思想（把 O(n) 摊成 O(1)/轮）。
+         *
+         *   ⚠ 这里的 cursor 用静态变量保存「上次检查到哪了」。
+         *     缺点是它对「客户端被删」不敏感（游标可能跳过几个），
+         *     所以下面加了「至少检查 1 个」的保底。 */
+        static Client *cursor = NULL;
+
+        int iterations = g_server.numclients / (g_server.hz > 0 ? g_server.hz : 1);
+        if (iterations < 1) iterations = 1;   /* ★ 保底：至少检查一个 */
+
+        Client *c = cursor ? cursor : g_server.clients;
+        while (iterations-- > 0 && c) {
+            Client *next = c->next;          /* ★ 先存：c 可能被踢掉 */
+
+            if (now - c->lastinteraction > limit_ms) {
+                printf("[fd=%d] 空闲超过 %d 秒，断开\n", c->fd, g_server.maxidletime);
+                freeClient(el, c);
+            }
+            c = next;
+        }
+        /* 记下游标；扫到末尾就从头再来 */
+        cursor = c ? c : g_server.clients;
+    }
+
+    /* 下次还是 1000/hz 毫秒之后（动态计算，避免误差累积） */
+    return 1000 / (g_server.hz > 0 ? g_server.hz : 10);
 }

@@ -450,7 +450,64 @@ PYEOF
 }
 assert_eq "并发能力：第 2/3 条连接可同时被服务（epoll 回归）" "OK" "$(py_concurrency_probe)"
 
-# 8.3 优雅退出回归（P0-2）：有客户端连接着时发 SIGINT，服务器必须能退出。
+# 8.3 定时器 / 空闲超时（阶段 4）：
+#     ★ 用一个【独立端口 + CLIENT_TIMEOUT=1】的服务器实例来做，
+#       因为主实例按默认配置（不超时）跑，而这一项要验证「超时确实会踢人」。
+#     验证两件事：
+#       a) 连上后完全不发数据的连接会被踢掉（防「只占 fd 不发数据」）
+#       b) 持续活动的连接不会被误踢（超时逻辑不能误伤）
+#     ⚠ 必须放在优雅退出（8.4）之前 —— 那一项会把主实例关掉。
+py_idle_timeout_probe() {
+    python3 - <<'PYEOF'
+import os, socket, subprocess, time
+host = os.environ.get('HOST', '127.0.0.1')
+port = int(os.environ.get('IDLE_PORT', '6399'))
+
+srv = subprocess.Popen(['./mini-redis', str(port)],
+                       env={**os.environ, 'CLIENT_TIMEOUT': '1'},
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    # 等就绪（不用固定 sleep，避免慢机器上偶发失败）
+    for _ in range(50):
+        try:
+            t = socket.create_connection((host, port), 0.2); t.close(); break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        print("SERVER_NOT_UP"); raise SystemExit
+
+    idle = socket.create_connection((host, port), 3)   # 连上后彻底不动
+    act  = socket.create_connection((host, port), 3)   # 持续活动
+
+    ok_active = 0
+    for _ in range(5):        # 约 2 秒，远超 1 秒的超时阈值
+        time.sleep(0.4)
+        try:
+            act.sendall(b"*1\r\n$4\r\nPING\r\n")
+            if act.recv(64) == b"+PONG\r\n": ok_active += 1
+        except OSError:
+            break
+
+    # 空闲连接现在应该已被服务器关闭
+    idle.settimeout(1.0)
+    try:
+        idle.sendall(b"*1\r\n$4\r\nPING\r\n")
+        idle_closed = (idle.recv(64) == b"")
+    except OSError:
+        idle_closed = True
+
+    idle.close(); act.close()
+    print("OK" if (idle_closed and ok_active == 5) else
+          "idle_closed=%s active=%d/5" % (idle_closed, ok_active))
+finally:
+    srv.terminate()
+    try: srv.wait(timeout=5)
+    except subprocess.TimeoutExpired: srv.kill()
+PYEOF
+}
+assert_eq "空闲超时：空闲连接被踢、活跃连接不受影响（定时器回归）" "OK" "$(py_idle_timeout_probe)"
+
+# 8.4 优雅退出回归（P0-2）：有客户端连接着时发 SIGINT，服务器必须能退出。
 #     修复前：readQueryFromClient 的 EINTR 分支无条件 continue，
 #             只要还有客户端连着，Ctrl+C 就永远退不出去（只能等客户端断开）。
 #     ⚠ 这一项会终止服务器，必须放在所有需要服务器的用例之后。
