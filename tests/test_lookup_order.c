@@ -197,7 +197,7 @@ static void test_ops_during_rehash(void)
             /* ★ 用 dictFindEntry 判定"在不在"，不用 dictFind：
              *   dictFind 返回的是 value，而本测试 val 传 NULL，
              *   所以 dictFind 恒返回 NULL，无法区分"不存在"和"存在但值为空"。
-             *   （这个歧义坑过一次，见 docs/dict-design.md §七） */
+             *   （这个歧义坑过一次，见 docs/字典设计.md §六） */
             unsigned long h = d->type->hashFunction((void *)keys[i]);
             if (dictFindEntry(d, keys[i], h) == NULL) find_fail++;
             /* ⚠ 只能回查【还活着】的 key：已删的 sds 已被 dictDelete 释放，

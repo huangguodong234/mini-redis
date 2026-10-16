@@ -45,7 +45,7 @@
  *        两张 dictType 唯一的差别就是最后两行 destructor。
  *
  *        为什么原来接不进去、为什么必须同时改类型与所有权
- *        —— 完整推导见 docs/dict-design.md。
+ *        —— 完整推导见 docs/字典设计.md。
  */
 
 #define SKIPLIST_MAX_LEVEL 32  // 跳表最大层数
