@@ -1,824 +1,831 @@
 # mini-redis
 
-用纯 C 语言手写的、实现 **RESP 协议编码**与 **8 个命令子集**的、内存级键值存储引擎。
-
-从 Socket 网络编程、RESP 协议解析，到哈希表、跳表、有序集合与 **SDS（简单动态字符串）**，全部手写，不依赖任何第三方库 —— 证明自己「能写底层」的最强证据。
-
-> ⚠️ **「兼容 Redis」的准确边界**（审查后修正，详见文末「与 Redis 的协议兼容性差距」小节）
-> 本项目实现的是 **RESP 协议编码**，并支持 `PING / SET / GET / DEL / ZADD / ZREM / ZSCORE / ZRANGE`
-> 这 8 个命令的**基础形态**，尚未做到与真实 Redis 的命令语义完全对齐。最需要注意的一条：
-> **有序集合目前是全局单例** —— `ZADD key score member` 里的 `key` 被忽略，
-> 不同 key 的成员会混在同一个 zset 里。
->
-> ⚠️ **关于「生产级」**：本项目面向学习与能力验证，**不是**生产可用的服务。
-> 它缺少认证、内存上限与连接超时。
-> 网络模型已从「阻塞式单连接串行」改造为 **epoll 事件循环 + 非阻塞 IO**
-> （可同时服务多连接、慢客户端不拖累他人，详见「开发日志」）。
-> 下文 §6 选型表中 SDS 版标注的「健壮」，仅指**相对无 SDS 版在数据正确性
-> （二进制安全、防缓冲区溢出）与容量上更健壮**，不等于生产可用。
-
-## 🚀 快速开始
-
-### 编译
-
-```bash
-make clean && make
-```
-
-### 运行服务器
-
-```bash
-./mini-redis
-```
-
-> 自定义端口（按优先级：命令行参数 > `PORT` 环境变量 > 默认 6379）：
-> ```bash
-> ./mini-redis 6390          # 命令行参数指定端口
-> PORT=6390 ./mini-redis     # 环境变量指定端口
-> ```
-
-### 用 redis-cli 连接测试
-
-```text
-redis-cli -h 127.0.0.1 -p 6379
-127.0.0.1:6379> SET name zhangsan
-OK
-127.0.0.1:6379> GET name
-"zhangsan"
-127.0.0.1:6379> DEL name
-(integer) 1
-
-127.0.0.1:6379> ZADD myzset 10 apple
-OK
-127.0.0.1:6379> ZADD myzset 5 banana
-OK
-127.0.0.1:6379> ZRANGE myzset 0 -1
-1) "banana"
-2) "apple"
-127.0.0.1:6379> ZSCORE myzset apple
-"10"
-127.0.0.1:6379> ZREM myzset banana
-(integer) 1
-```
-
-### 跑全量回归测试
-
-```bash
-./test.sh        # 集成回归（协议 / 二进制 / 大值 / 断连 / 退出），全部通过
-```
-
-## 🏗️ 项目架构
-
-```
-mini-redis/
-├── include/
-│   ├── protocol.h    # 协议解析接口
-│   ├── storage.h     # 存储层接口
-│   ├── dict.h        # 通用哈希表接口（void* key/value + dictType 函数表）
-│   ├── skiplist.h    # 跳表接口
-│   ├── zset.h        # 有序集合接口
-│   ├── commands.h    # 命令分发接口
-│   └── sds.h         # 简单动态字符串接口（二进制安全 + 自动扩容）
-├── src/
-│   ├── server.c      # 服务器主程序（Socket + 请求生命周期 + RESP 发送层）
-│   ├── protocol.c    # RESP 协议解析器
-│   ├── commands.c    # 命令分发（PING/SET/GET/DEL/ZADD/ZREM/ZSCORE/ZRANGE）
-│   ├── storage.c     # 存储层（封装哈希表，所有权转移边界）
-│   ├── dict.c        # 通用哈希表实现（djb2 + 链地址法 + 自动扩容 + 策略表）
-│   ├── skiplist.c    # 跳表实现（span 跨度 + dict 哈希索引）
-│   ├── zset.c        # 有序集合（封装跳表，深拷贝边界）
-│   ├── sds.c         # SDS 实现（5 档 header + 二进制安全 + 预分配扩容）
-├── docs/
-│   └── dict-design.md    # 通用哈希表设计笔记（为什么能通用 / vtable 多态 / Redis 对照）
-├── tests/            # 断言式单元测试（make unit / make check）
-│   ├── test_sds.c        # SDS：二进制安全、TYPE_5 边界、动态扩容
-│   ├── test_dict.c       # 哈希表：增删改查、自动扩容、★ 通用性（非 sds 类型 + 借用语义）
-│   ├── test_skiplist.c   # 跳表：排序正确性、随机压力、删除与更新分数
-│   ├── test_skipspan.c   # 跳表 span：45.8 万次操作对照暴力参考数组
-│   └── test_zset.c       # 有序集合：steal 所有权、range 深拷贝边界
-├── test.sh           # 自动化回归测试脚本（支持 HOST/PORT/SKIP_BUILD 覆盖）
-├── archive/          # ⚠️ 历史归档，不参与构建：早期打印式 demo，API 已过时
-│   └── 旧 main.c / zset.c / test_*.c，仅作过程记录，勿直接编译运行
-├── bench/            # 压测与探针脚本合集
-│   ├── bench.sh         # redis-benchmark 多命令/多并发/多数据量压测
-│   ├── bench_py.py      # 流水线吞吐 + 延迟分布快测
-│   ├── bench_collect.py # 多流水线深度/多命令/多负载 QPS → CSV
-│   ├── bench_focus.py   # 聚焦压测（固定流水线深度 SET/GET/大值 QPS，sds vs 无sds 对比）
-│   ├── bench_ping_curve.py # PING 流水线深度缩放曲线
-│   ├── bench_latency.py   # 延迟分布（多档位大值 SET/GET 的 min/avg/p50/p99，sds vs 无sds）
-│   ├── bench_throughput.py # 大数据吞吐（多档位大值 SET/GET 的流水线 QPS + MB/s 载荷吞吐）
-│   ├── bench_extreme.py    # 综合压测（极限吞吐 + 串行延迟 + 跳表 zset，支持 3 版二进制对比）
-│   ├── bench_ab.py         # 交错 A/B（同一脚本轮换两版二进制，取中位数对比，抗机器漂移）
-│   └── correctness_probe.py # 二进制安全 / 大值正确性探针
-├── Makefile
-└── README.md
-```
-
-### 架构分层
-
-```text
-┌─────────────────────────────────────────────┐
-│  网络层 (server.c)  readQueryFromClient       │  ← Socket 通信、事件循环、请求生命周期
-├─────────────────────────────────────────────┤
-│  协议层 (protocol.c / server.c)               │  ← RESP 解析（multibulk + inline 状态机）
-├─────────────────────────────────────────────┤
-│  命令层 (commands.c)  handle_command          │  ← PING/SET/GET/DEL/ZADD/ZREM/ZSCORE/ZRANGE
-├─────────────────────────────────────────────┤
-│  存储层 (storage.c / zset.c)                  │  ← 封装哈希表与有序集合，深拷贝边界
-├─────────────────────────────────────────────┤
-│  数据结构层 (dict / skiplist / sds)           │  ← 通用哈希表 / 跳表 / 简单动态字符串
-└─────────────────────────────────────────────┘
-```
-
-## 🔄 请求生命周期：从进来到最后发出去
-
-这是**一条命令从到达服务器到把响应发回客户端**的完整数据流动，标注了每层的函数、数据类型和数据所有权变化。
+纯 C 手写的内存键值存储引擎：**RESP 协议编码 + 8 个命令 + epoll 事件循环 + 定时器**。
+从 socket、协议解析到哈希表、跳表、SDS，全部手写，**零第三方依赖**。
 
 ```mermaid
-flowchart TD
-    A["TCP 数据到达<br/><code>read()</code> → 临时 <code>char rbuf[4096]</code><br/>（栈上，不持有）"] 
-    --> B
-
-    subgraph L1["第 1 层 · 读入缓冲"]
-        B["<b>readQueryFromClient</b><br/><code>sds querybuf</code>（Client 字段）<br/><code>sdscatlen</code> 追加 → sds 自动扩容<br/>所有权：querybuf 归 Client"]
-        B --> B1["半包/粘包处理<br/>数据跨多次 read 拼接完整"]
-    end
-
-    L1 --> L2["第 2 层 <b>processInputBuffer</b><br/>游标 <code>qb_pos</code> 驱动，压缩已处理垃圾<br/>（<code>sdsrange</code> memmove）"]
-
-    L2 --> M{首字节<br/>'*' 或跨帧?}
-    M -- "是" --> L3a["第 3 层 <b>processMultibulkBuffer</b><br/>RESP 数组状态机<br/><code>*N</code> → <code>$L</code> → 内容"]
-    M -- "否" --> L3b["第 3 层 <b>processInlineCommand</b><br/>空格/Tab 切分一行"]
-
-    L3a --> P["每个参数提取为 <b>sds</b><br/><code>argv[]</code>（sds* 数组，归 Client）<br/>内容只读引用 querybuf，<b>不拷贝</b>（借用手工提取）"]
-    L3b --> P
-
-    P --> C["<b>handle_command</b>（命令层）<br/><code>(fd, Command* cmd)</code><br/>Command 薄包装打包 argc + argv[]（借视图）"]
-
-    C --> D{"命令分支"}
-
-    D -- "SET" --> S1["storage_set_steal（默认）<br/>key/value 的 sds 所有权<b>直接移交</b>哈希表<br/>两格 argv 置 NULL，省两次 sdsdup+两次 sdsfree"]
-    D -- "GET" --> G1["storage_get 返回<b>可拥有深拷贝</b><br/>sdsdup 快照（与哈希表无关）<br/>调用方 sdsfree"]
-    D -- "ZADD" --> Z1["zset_add steal<br/>member 所有权<b>直接移交</b>跳表<br/><code>argv[3] 置 NULL</code>"]
-    D -- "ZRANGE" --> Z2["zset_range 深拷贝<br/>逐个 sdsdup → 可拥有数组<br/>调用方逐个 free"]
-    D -- "PING/ZREM/DEL" --> O1["直接应答或整数结果"]
-
-    S1 --> R["RESP 响应<br/>send_* 辅助函数"]
-    G1 --> R
-    Z1 --> R
-    Z2 --> R
-    O1 --> R
-
-    R --> S["<b>send_response(fd, data, len)</b><br/>分段直发（无不定长固定数组）<br/>二进制安全：按 len 发，不靠 '\\0'"]
-    S --> E["客户端收到响应"]
-
-    style E fill:#d1f7c4
+flowchart LR
+    A["客户端<br/>redis-cli / nc / 自研压测"] -->|"TCP + RESP"| B["mini-redis<br/>单线程事件循环"]
+    B -->|"SET / GET / ZADD ..."| C["内存存储<br/>哈希表 + 跳表"]
 ```
-
-**所有权速查表**
-
-| 数据 | 生命周期 | 谁负责释放 |
-|------|---------|-----------|
-| `rbuf[4096]` | 单次 read 后即弃 | 栈（无需释放） |
-| `querybuf` (sds) | 整个连接期间 | `free_client` → `sdsfree` |
-| `argv[]`（协议层提取的 sds） | 单条命令后释放；**SET 的 key/value 两格例外**——被 `storage_set_steal` 移交给哈希表且置 NULL | `processMultibulkBuffer` / `processInlineCommand`（SET 两格由哈希表释放） |
-| 哈希表 key/value | 存入即归哈希表 | `hashtable_free` / `hashtable_del` |
-| 跳表 member | 存入即归跳表 | `skiplist_free` / `skiplist_del` |
-| `zset_range` 返回数组 | 调用方使用完毕后 | 命令层逐个 `sdsfree` + `free` |
-| `storage_get` 返回值 | 可拥有深拷贝（与哈希表无关的快照） | 命令层 `sdsfree` |
-
-## 🧵 SDS：简单动态字符串
-
-SDS 是这套引擎的数据基石 —— 协议解析、缓冲管理、底层存储全部用它。它解决了裸 C 字符串的 5 个缺陷：
-
-1. **取长度 O(1)**：header 里存了 `len`，不用 `strlen` 从头扫。
-2. **二进制安全**：按 `len` 处理数据，数据里含 `\0` 也不会被切断。
-3. **防缓冲区溢出**：拼接前检查容量，自动扩容，杜绝 `strcpy/strcat` 越界。
-4. **避免频繁重分配**：`sdsMakeRoomFor` 预分配（<1MB 翻倍 +1，≥1MB +1MB）。
-5. **自描述**：`len/alloc/flags` 都在 header 里，字符串知道自己多大。
-
-### 5 档 header（根据长度选最小档）
-
-| 类型 | flags 编码 | 覆盖长度 | header 大小 |
-|------|-----------|---------|------------|
-| `SDS_TYPE_5` | 高 5 位存 len | 0–31 字节 | 1 字节 |
-| `SDS_TYPE_8` | `uint8` | 0–255 | 3 字节 |
-| `SDS_TYPE_16` | `uint16` | 0–64K | 5 字节 |
-| `SDS_TYPE_32` | `uint32` | 0–4G | 9 字节 |
-| `SDS_TYPE_64` | `uint64` | 超大 | 17 字节 |
-
-`char *s` 指向数据区起点，前面紧贴一个 `sdshdr`。`sdslen()` 通过 `s[-1]` 反向回溯 header 读 `len`，O(1)。
-
-> ⚠️ **踩过的坑（已修复）**：`SDS_TYPE_5` 用 `len << 3` 存在 `s[-1]` 里。当 `len ∈ [16,31]` 时 `len << 3 ≥ 0x80`，作为 **有符号 char** 是负数，`s[-1] >> 3` 算术右移会变成巨大 `size_t`（如 `0xFFFFFFFFFFFFFFF0`），导致 `sdsdup`/`sdsnewlen` 拷贝巨大长度 → 缓冲区溢出崩溃。修复：右移前先 `(unsigned char)` 强转。
-
-## ✅ 全量测试
-
-`./test.sh` 覆盖（用例数随回归补充增长，以脚本输出的 `N/N 通过` 为准）：
-
-| 分组 | 覆盖点 |
-|------|--------|
-| 基础命令 | PING / SET / GET / DEL 正常路径 |
-| 有序集合 | ZADD / ZREM / ZSCORE / ZRANGE、反序、重复 member 更新分数 |
-| 边界与异常 | 未知命令、参数个数错误、非法 score（NaN/垃圾）、非法索引、ZADD 同分 |
-| 协议解析 | multibulk / inline、空行忽略、粘包与**半包分帧**（header 分段、bulk 内容分段） |
-| 二进制安全 | 含 `\0` 的值、二进制 zset member |
-| 超大值 | 2000B / 8192B / 320KB 值（验证 sds 动态扩容 + 无固定缓冲限制） |
-| 断连与退出 | 客户端强制 RST 断连后服务器仍存活（SIGPIPE 回归）；有连接时 SIGINT 能优雅退出 |
-| 并发（记录项） | 第 2 条连接是否被第 1 条阻塞 —— 当前属已知限制，只记录不计分 |
-
-**单元测试**（`make unit`，不依赖 redis-cli / 不可联网也能跑）：
-
-| 测试 | 覆盖 |
-|------|------|
-| `test_sds` | 二进制安全 / TYPE_5 边界 / 动态扩容 |
-| `test_dict` | 增删改查 / 自动扩容后数据完整性 / **通用性**（非 sds 类型 + 借用语义） |
-| `test_skiplist` | 排序正确性 / 500 成员随机压力 / 删除与更新分数 |
-| `test_skipspan` | span 与排名正确性（45.8 万次操作对照暴力参考数组，458 项） |
-| `test_zset` | steal 所有权 / range 深拷贝边界 |
-
-`make check` = 单元测试 + 集成回归；`make asan` 会用 ASan/UBSan 重编以检测内存问题。
-
-**当前结果：集成 51/51 ✅ · 单元 5/5 ✅ · ASan/UBSan/LSan 零泄漏 ✅**
-
-## 📊 压测数据
-
-### 测试环境与基线
 
 | | |
 |---|---|
-| **机器** | VMware 虚拟机 · 2GB 内存 · RHEL 8.10 · gcc 8.x |
-| **SDS 版** | 当前 `master` |
-| **无 SDS 基线** | 提交 `393ced1`（改造前）：固定 `char querybuf[1024]` + 裸 C 字符串（`malloc(len+1)` + `strcpy`，遇 `\0` 截断、固定容量上限） |
-| **复现** | `make benskip`（跳表算法层）· `bench/correctness_probe.py` · `bench_focus.py` · `bench_throughput.py` · `bench_latency.py` |
+| **语言 / 依赖** | C99 · 无第三方库 · Linux（epoll） |
+| **网络模型** | 单线程 epoll 事件循环 + 非阻塞 IO + 输出缓冲 |
+| **协议** | RESP（数组协议）+ inline 命令（兼容 nc/curl） |
+| **命令** | `PING` `SET` `GET` `DEL` `ZADD` `ZREM` `ZSCORE` `ZRANGE` |
+| **代码量** | `src/` 3936 行 · `include/` 1384 行 |
+| **验证** | 集成 54/54 · 单元 6/6 · ASan/UBSan/LSan 零泄漏 · 零告警 |
 
-> ⚠️ **波动提示**：本机是 VM，单跑吞吐波动可达 **±30%**（SET 57k~83k 都出现过）。
-> 小命令吞吐**看量级即可**；要做严格对比请看**延迟**（更稳定）与**交错 A/B**（§7）。
-
-### 四把尺子
-
-同一份数据从四个角度量，各回答一个问题：
-
-```dsh-ui
-{"title":"压测数据的四个维度","gap":12,"items":[{"type":"table","columns":["尺子","量什么","回答的问题","在哪一节"],"rows":[["① 正确性","能不能存、存了会不会丢/崩","能不能用","§1"],["② 吞吐 QPS","流水线 depth=200，单位时间处理多少命令","快不快","§2 §6"],["③ 载荷吞吐 MB/s","流水线，单位时间读写多少字节","大值扛不扛得住","§3"],["④ 延迟 µs","串行 RTT，单次操作真实耗时","响应手感如何","§4 §6"]],"types":["text","text","text","text"]},{"type":"callout","tone":"info","title":"怎么读下面这些表","content":"每个小节都是「表格给原始数字 + 图给直观对比 + 读它给结论」。如果只想看结论，直接跳到 §8 的一页总结。"}]}
-```
+> ⚠️ **定位：学习与能力验证项目，不是生产可用服务。**
+> 缺认证、内存上限、持久化；有序集合是**全局单例**（`ZADD` 的 key 被忽略）。
+> 详见 [§7 与 Redis 的差距](#7-与-redis-的差距)。
 
 ---
 
-### 1. 正确性：能不能用（二进制安全 + 大值）
+## 目录
 
-| 测试项 | SDS 版 | 无 SDS 版 |
-|--------|--------|----------|
-| 含 `\0` 的值（`A\x00xy`） | ✅ 原样存取 | ❌ 截断成 `A`（strcpy 遇 `\0` 停） |
-| 16 字节 key（TYPE_5 边界）、32B key | ✅ | ✅ |
-| 2000B / 64KB / 320KB 值 | ✅ 任意大小 | 💥 崩溃（>1KB 固定缓冲溢出） |
-| 二进制 zset member | ✅ | —（崩溃前未测到） |
-
-> **结论**：正确性是 SDS 的胜负手——二进制安全（`\0` 不截断）+ 无固定容量上限。无 SDS 在 >1KB 的值上直接缓冲区溢出崩溃。
-
----
-
-### 2. 小命令吞吐（流水线 depth=200，QPS）
-
-| 操作 | SDS 版 | 无 SDS 版 | 说明 |
-|------|--------|----------|------|
-| SET | 54,674 | 136,534 | 无 SDS 快约 **2.5x** |
-| GET | 55,477 | 166,999 | 无 SDS 快约 **3x** |
-
-```dsh-ui
-{"title":"小命令吞吐 · 无SDS 更快 (depth=200, QPS)","gap":12,"items":[{"type":"chart","kind":"bars","data":[{"label":"无SDS GET","value":166999},{"label":"无SDS SET","value":136534},{"label":"SDS GET","value":55477},{"label":"SDS SET","value":54674}],"horizontal":true},{"type":"callout","tone":"info","title":"为什么小命令下无 SDS 反而更快？","content":"无 SDS 用固定栈缓冲 + 直接 memcpy，零动态分配；SDS 每次命令有 header 校验 + sdsMakeRoomFor 预分配等动态分配开销。服务器本身是 IO 瓶颈，无 SDS 省掉了命令构造开销，所以小命令快 2-3 倍。但这份速度换来的是无法处理 >1KB 值、无法存取含 \\0 的二进制数据。"}]}
-```
+- [1. 快速开始](#1-快速开始)
+- [2. 完整代码调用图](#2-完整代码调用图)
+- [3. 项目结构](#3-项目结构)
+- [4. 请求生命周期](#4-请求生命周期)
+- [5. 测试与验证](#5-测试与验证)
+- [6. 性能数据](#6-性能数据)
+- [7. 与 Redis 的差距](#7-与-redis-的差距)
+- [8. 配套文档](#8-配套文档)
+- [9. 开发日志](#9-开发日志)
+- [10. 开发工具](#10-开发工具)
 
 ---
 
-### 3. 大数据吞吐（流水线 depth=200，QPS + 载荷 MB/s）
+## 1. 快速开始
 
-> 这是「单位时间能读写多少**字节**」——对 SET 是写入值字节，对 GET 是读出值字节（= QPS × 值大小）。无 SDS 在 512B 后（≥1KB）因固定缓冲溢出崩溃，故只有 512B 一档；SDS 全档位存活。
-
-| 值大小 | SDS SET QPS (MB/s) | SDS GET QPS (MB/s) | 无SDS SET QPS (MB/s) | 无SDS GET QPS (MB/s) |
-|--------|-------------------|-------------------|----------------------|----------------------|
-| 512B | 80,108 (**39**) | 87,532 (**43**) | **159,077** (**78**) | **177,609** (**87**) |
-| 1KB | 70,429 (69) | 68,919 (67) | 💥 崩溃 | 💥 崩溃 |
-| 4KB | 61,950 (242) | 68,993 (269) | 💥 崩溃 | 💥 崩溃 |
-| 32KB | 33,548 (1,048) | 17,417 (544) | 💥 崩溃 | 💥 崩溃 |
-| 128KB | 13,395 (1,674) | 3,127 (391) | 💥 崩溃 | 💥 崩溃 |
-
-```dsh-ui
-{"title":"大数据吞吐 · 仅 SDS 存活 (depth=200, 载荷 MB/s)","gap":12,"items":[{"type":"chart","kind":"line","series":[{"label":"SDS SET (写入)", "data":[{"label":"512B","value":39},{"label":"1KB","value":69},{"label":"4KB","value":242},{"label":"32KB","value":1048},{"label":"128KB","value":1674}]},{"label":"SDS GET (读出)", "data":[{"label":"512B","value":43},{"label":"1KB","value":67},{"label":"4KB","value":269},{"label":"32KB","value":544},{"label":"128KB","value":391}]}]},{"type":"callout","tone":"error","title":"512B 后无 SDS 直接崩","content":"无 SDS 只有 512B 一档（SET 78 / GET 87 MB/s，还比 SDS 快约 2 倍）；从 1KB 起因固定 1024 字节缓冲溢出而崩溃。SDS 的写吞吐随值变大一路冲到 128KB 的 1674 MB/s —— 单线程 IO 被榨满，这就是 SDS 在大值吞吐上的能力边界。"}]}
-```
-
-> **读它**：小值（512B）时无 SDS 的载荷吞吐是 SDS 的 ~2 倍；但一旦值 ≥1KB，无 SDS 直接崩，SDS 仍能以 39→1674 MB/s 的坡度持续扩容。**大值吞吐是 SDS 的专属战场**。
-
----
-
-### 4. 延迟分档（串行 RTT，µs，N=3000）
-
-> 发一条 → 等回复 → 再发下一条的**单命令真实延迟**（用户感知）。与第 2/3 节的流水线吞吐互补。
-
-| 操作 · 档位 | SDS avg/p50/p99 | 无SDS avg/p50/p99 |
-|------------|----------------|-------------------|
-| SET 8B | 120 / 106 / 213 | **82 / 72 / 191** |
-| GET 8B | 141 / 132 / 241 | **101 / 90 / 221** |
-| SET 512B | 129 / 116 / 237 | **112 / 98 / 218** |
-| GET 512B | 122 / 110 / 229 | **100 / 87 / 206** |
-| SET 1KB / 4KB / 32KB | 121–134 / 109–121 / 221–237 | 💥 崩溃 |
-| SET 128KB | 192 / 175 / 309 | 💥 崩溃 |
-| GET 128KB | 225 / 218 / 339 | 💥 崩溃 |
-
-```dsh-ui
-{"title":"① 小命令延迟 (µs) · 无SDS 略低","gap":12,"items":[{"type":"chart","kind":"bars","data":[{"label":"GET 8B 无SDS","value":101},{"label":"GET 8B SDS","value":141},{"label":"SET 8B 无SDS","value":82},{"label":"SET 8B SDS","value":120},{"label":"GET 512B 无SDS","value":100},{"label":"GET 512B SDS","value":122},{"label":"SET 512B 无SDS","value":112},{"label":"SET 512B SDS","value":129}],"horizontal":true}]}
-```
-
-```dsh-ui
-{"title":"② 大值延迟 · 只有 SDS 存活 (SET avg µs)","gap":12,"items":[{"type":"chart","kind":"line","series":[{"label":"SDS (全档位稳定)", "data":[{"label":"8B","value":120},{"label":"512B","value":129},{"label":"1KB","value":123},{"label":"4KB","value":121},{"label":"32KB","value":134},{"label":"128KB","value":192}]}]},{"type":"callout","tone":"error","title":"大值延迟上无 SDS 无数据","content":"小命令（≤512B）下无 SDS 延迟比 SDS 低约 10-30%（无动态分配）。但 1KB 起无 SDS 崩溃，SDS 延迟从 ~120µs 平滑升到 128KB 的 ~192µs，依旧稳定服务 —— 这就是 SDS 的延迟优势区。"}]}
-```
-
-> **怎么读**：小命令（≤512B）无 SDS 快 10%–30%；**≥1KB 无 SDS 崩溃，SDS 以 120µs→192µs 平滑续服务**。SDS 的延迟曲线在 4KB 前几乎平（~120µs），远没到瓶颈。
-
----
-
-### 5. PING 流水线深度缩放（QPS vs 管道深度）
-
-| 管道深度 | SDS 版 | 无 SDS 版 |
-|---------|--------|----------|
-| 1 | 7,579 | 10,422 |
-| 10 | 33,896 | 59,609 |
-| 50 | 54,519 | 117,547 |
-| 200 | 61,126 | 175,638 |
-| 500 | 61,763 | 153,960 |
-| 1000 | 64,945 | 170,483 |
-
-```dsh-ui
-{"title":"PING 流水线深度缩放曲线","gap":12,"items":[{"type":"chart","kind":"line","series":[{"label":"无 SDS","data":[{"label":"1","value":10422},{"label":"10","value":59609},{"label":"50","value":117547},{"label":"200","value":175638},{"label":"500","value":153960},{"label":"1000","value":170483}]},{"label":"SDS","data":[{"label":"1","value":7579},{"label":"10","value":33896},{"label":"50","value":54519},{"label":"200","value":61126},{"label":"500","value":61763},{"label":"1000","value":64945}]}]}]}
-```
-
-> 两条曲线都随管道深度上升，无 SDS 上限显著更高（~17 万 vs ~6.5 万）。
-
----
-
-### 6. 使用场景决策：什么时候该用无 SDS，什么时候该用 SDS？
-
-| 你的场景 | 该用谁 | 原因 |
-|---------|--------|------|
-| 缓存/序列化数据（含 `\0`、二进制） | **SDS** | 无 SDS 遇 `\0` 截断丢数据 |
-| 值可能 >1KB（图片、日志、大文档） | **SDS** | 无 SDS 固定 1024 缓冲溢出崩溃 |
-| 纯文本小 KV，极致压 QPS | 无 SDS | 小命令快 2-3 倍 |
-| 生产环境、要防崩溃 | **SDS** | 自动扩容 + 二进制安全（仅限**数据正确性**层面；认证/并发/持久化仍缺失，见「待实现」） |
-| 追求极低单命令延迟 | 无 SDS 略优 | 但仅限 ≤512B 才成立 |
-
-逐维度对照：
-
-```dsh-ui
-{"title":"无 SDS vs SDS · 逐维度对照","gap":12,"items":[{"type":"table","columns":["维度","无 SDS","SDS"],"rows":[["小命令(≤512B) 吞吐","✅ 快 2-3 倍","约为 1/3"],["大值(≥1KB) 吞吐/延迟","💥 崩溃","✅ 39→1674 MB/s"],["二进制安全(含 \\0)","❌ 截断","✅ 原样"],["防缓冲区溢出","❌ 固定 1024 易崩","✅ 自动扩容"],["单连接串行延迟","✅ 低 10-30%","略高"],["数据正确性与容量健壮性","❌ 二进制/大值错乱崩溃","✅ 二进制安全 + 任意大小"]],"types":["text","text","text"]}]}
-```
-
----
-
-### 7. 总结：SDS 到底提升了什么？
-
-**SDS 没有让原始 QPS 变快，甚至略慢**，但它在**能力边界**上是质变：
-
-```dsh-ui
-{"title":"SDS 带来的真实提升","gap":12,"items":[{"type":"list","items":[{"title":"二进制安全","desc":"值/键/member 里可以含 \\0 字节。无 SDS 用 C 字符串遇 \\0 截断，会丢数据。对二进制协议/序列化数据是刚需。"},{"title":"无固定容量上限","desc":"querybuf 不再是写死的 char[1024]。1KB、64KB、320KB 的值都能存。无 SDS 在 >1KB 上缓冲区溢出直接崩溃。"},{"title":"大数据吞吐容量","desc":"128KB 值仍有 1674 MB/s 写入载荷吞吐；无 SDS 在 1KB 就崩。"},{"title":"O(1) 长度 + 自动扩容","desc":"header 存 len，取长不扫全串；sdsMakeRoomFor 预分配避免频繁 realloc，天然防缓冲区溢出。"},{"title":"代价：小命令略慢","desc":"动态分配 + header 处理让每个小命令多几条指令，原始小命令 QPS 约为无 SDS 的 1/3。"}]}]}
-```
-
-**一句话总结**：无 SDS 是「快但脆」—— 小命令快 3 倍、延迟低 30%，却扛不住 >1KB 的数据和含 `\0` 的二进制值；SDS 是「稳而全」—— 牺牲一点小命令速度，换来二进制安全 + 任意大小 + 大数据吞吐 + 防溢出，这才是生产级 KV 该有的样子。
-
----
-
-### 8. 极限吞吐与延迟（当前版本，三版对比：SDS默认 / SDS+argv不释放 / 无SDS）
-
-> 这一节回答「当前这个版本处理同一类数据，极限在哪」。吞吐用流水线（depth=200）逼近服务器处理上限，延迟用串行 RTT。三版为同一套源码：`master` 默认（深拷贝）、加 `-DSTEAL_ARGV` 编译（argv 直接移交哈希，不深拷贝）、以及无 SDS 基线（`393ced1`）。
-> ⚠️ 本机是 VM，单跑吞吐波动可达 ±30%（57k~83k QPS 都出现过），小命令吞吐看量级即可；延迟（更稳定）和**交错 A/B**（见第 10 节）才是可信对比。
-
-| 指标 | SDS 默认 | SDS+steal | 无 SDS |
-|------|---------|-----------|--------|
-| SET 8B 吞吐 (QPS) | ~57k | ~68k | **~159k** |
-| GET 8B 吞吐 (QPS) | ~57k | ~70k | **~179k** |
-| SET 8B 延迟 avg (µs) | **110.6** | 117.2 | 98.9 |
-| GET 8B 延迟 avg (µs) | 120.1 | 131.9 | **121.5** |
-
-```dsh-ui
-{"title":"极限吞吐 · 无SDS 独占鳌头 (depth=200, QPS)","gap":12,"items":[{"type":"chart","kind":"bars","data":[{"label":"无SDS GET","value":179},{"label":"无SDS SET","value":159},{"label":"SDS+steal GET","value":70},{"label":"SDS+steal SET","value":68},{"label":"SDS默认 GET","value":57},{"label":"SDS默认 SET","value":57}],"horizontal":true}]}
-```
-
-> **读它**：吞吐上无 SDS 明显领先（~2.5-3x），这是它「快」的来源；但这份速度归因于去掉 sds 的动态分配，代价是 >1KB 就崩、遇 `\0` 截断。SDS 默认与 SDS+steal 的差距在噪声范围内（见第 10 节的严格 A/B）。延迟三版都在 ~100-130µs 量级，无 SDS 略低但不显著。
-
----
-
-### 9. 跳表：span + O(1) find，让跳表发挥出应有的复杂度
-
-跳表做过两轮 Redis 对齐改造（见 `include/skiplist.h` 顶部注释）：
-
-**第一轮：补上复杂度短板**
-
-1. **`SkipListLevel {forward, span}`** —— 每个前进指针带上 `span`（该层一跳跨越的节点数）。做范围查询 / 问排名时可以**顺着高层累加 span 直接跳到目标排名**（`skiplist_get_rank` / `skiplist_range`），不再沿第 0 层 `for` 循环走过去。复杂度 **O(n) → O(log n)**。
-2. **member → SkipNode 哈希索引** —— `skiplist_find` 从「第 0 层线性扫描」变成 **O(1) 哈希直查**。ZADD 查重、ZSCORE/ZREM 的成员定位都随之 O(1)。
-
-**第二轮：索引改用通用哈希表（消除重复实现）**
-
-第一轮的索引是在跳表里**又写了一份**哈希表（约 100 行）。根因是原 `hashtable` 把「value 必须是 `sds`」和「表负责 free key/value」焊死在接口上，而索引要的是「value 是个 `SkipNode*`」+「一个都不许 free」—— 两条都冲突。
-
-后来 `hashtable` 泛型化成了 **`dict`**（`void* key` + `void* val` + `dictType` 函数表），索引就直接复用它了：
-
-```c
-/* skiplist.c：挂一份「借用语义」的 dictType 即可 */
-static dictType skipIndexDictType = {
-    dictSdsHash, dictSdsKeyCompare,  /* 复用 sds 那套（member 也是 sds） */
-    NULL, NULL, NULL,                /* 不拷贝 */
-    skipIndexKeyDestructor,          /* ★ 借用 → 空操作 */
-    skipIndexValDestructor,          /* ★ 借用 → 空操作 */
-};
-sl->index = dictCreate(&skipIndexDictType, NULL);
-```
-
-那 100 行整体删除，`skiplist_find` 退化为一行 `dictFind`。**设计推导见 `docs/dict-design.md`。**
-
-> 服务端框架（RESP 解析 + 每段 `write()` 系统调用）把单连接命令 QPS 压在 ~50k 量级（连纯 PING 都只有 ~49k），端到端 QPS 测不出跳表算法的量级差。所以下面是**算法层微基准** `bench/bench_skipspan.c`（直接调 `skiplist` API、绕过框架、`-O2` 编译）的实测，用「数字是否随表大小增长」来实证复杂度。
-
-| 操作（算法层，ns/op） | 旧版 n=1 万 | 旧版 n=3 万 | 新版 n=1 万 | 新版 n=20 万 | 新版 n=40 万 | 复杂度 |
-|---|---|---|---|---|---|---|
-| `find`（member 点查） | 117,947 | 726,687 | 56 | 199 | 261 | 旧 O(n) → 新 **O(1)** |
-| `range` 跳到 start=0 收集 10 个 | 39 | 42 | 46 | 77 | 46 | 都 O(1)（收集固定量） |
-| `range` 跳到 start≈n/2 收集 10 个 | 95,952 | 513,229 | 99 | 258 | 82 | 旧 O(n) → 新 **O(log n)** |
-| `range` 跳到 start≈n 收集 10 个 | 223,729 | 1,249,593 | 184 | 203 | 86 | 旧 O(n) → 新 **O(log n)** |
-| `get_rank`（求成员排名） | — | — | 526 | 2,024 | 2,304 | 新 **O(log n)** |
-| `add`（更新已有成员分数） | — | — | 1,244 | 3,817 | 4,128 | 新 **O(log n)** |
-
-> **数据说明**：
-> - 「旧版」两列来自**改造前源码**（提交 `1ba4fce`，无 span、无索引），保留作为复杂度对照。
-> - 「新版」三列是**当前 master**（索引已改用 `dict`）的 3 次运行**中位数**，`REPS=500,000`。
-> - 与上一版 README 相比数字略有变化（如 find 40 万：275 → 261 ns），因为索引从跳表自造的表改成了通用 `dict` —— 多两次函数指针间接调用（无法内联）。**绝对值差异在噪声与缓存效应量级，复杂度不变。**
-> - 复现：`make benskip RUN=400000`
-
-```dsh-ui
-{"title":"跳表升级实测：旧版随表增长，新版几乎不变 (ns/op)","gap":12,"items":[{"type":"chart","kind":"bars","data":[{"label":"旧 find n=3万 726,687ns","value":726687},{"label":"新 find n=40万 261ns","value":261},{"label":"旧 range到尾 n=3万 1,249,593ns","value":1249593},{"label":"新 range到尾 n=40万 86ns","value":86}],"horizontal":true},{"type":"callout","tone":"success","title":"要点：新版与表大小无关，旧版线性增长","content":"旧版 find 从 n=1 万（118µs）到 n=3 万（727µs）涨了 6 倍多（线性）；新版从 n=1 万到 n=40 万始终在 56~261 ns（哈希 O(1)，只随缓存涨一点）。最惨的场景旧版 range 跳到表尾要 1.25ms（for 走 2.9 万节点），新版 40 万的表尾只要 86ns（span 直跳）。且新版 range 成本与 start 位置几乎无关（46~99ns），这正是加 span 的意义。"}]}
-```
-
-> **读它**：改造前 `skiplist_find` 是第 0 层线性扫描（O(n)），ZADD 每次插入还先调一次 find 查重，所以 ZADD/ZSCORE/ZREM 实际都是 O(n)，成员一多就线性变慢。现在 find 走哈希索引（O(1)），range 与 get_rank 走 span（O(log n)），跳表在「按分数/名次查」场景下才真正匹配它该有的复杂度，且不再被查重拖回 O(n)。
->
-> 验证：`tests/test_skipspan.c` 用暴力参考数组对 45.8 万次插入/删除/更新随机交叉验证 `get_rank` 与 `range`（含负索引）全部一致（458 项）；`make check`（单元 5/5 + 集成 51/51）与 ASan/UBSan/LSan 全路径零泄漏。
-
----
-
-### 10. 「argv 不释放给哈希」优化（steal 为默认行为）
-
-> 你问：每 SET 完，`server.c` 把解析出的 argv sds 全 `sdsfree` 掉了；能不能**不释放、直接把这些 sds 的所有权移交给哈希表**，省掉 storage 里 `sdsdup` 深拷贝 + 之后 `sdsfree` 的那几次分配/释放？
->
-> 两件事的最终形态：
->
-> 1. **steal 所有权是默认行为**（不再是编译开关）——SET 分支恒走 `storage_set_steal()`：把 key/value 两格 sds 的所有权直接交给哈希表，并把这俩 `argv[i]` 置 `NULL`。`server.c` 的释放循环对 `NULL` 是安全 no-op，不 double-free；哈希表在 duplicate-key（`sdsfree(key)`）、OOM 拒绝（`sdsfree(key)+sdsfree(value)`）等路径都**自行释放传入的 sds**，故不泄漏。**51/51 回归测试通过**，覆盖写、二进制 `\0`、DEL 后重写都无泄漏/无崩溃。
-> 2. **`Command{int argc; sds *argv;}` 结构体保留**（作为薄包装）——`handle_command` 收 `(int fd, Command *cmd, ...)`，server.c 把 `c->argc/c->argv` 打成一个局部 `Command` 提交。它只是"借视图"（`cmd.argv` 指向解析器建的数组，所有权仍归调用方），不是所有权容器；SET steal 时置 `cmd->argv[i] = NULL` 即作用于原数组本身。这个包装收益≈0（栈上两次赋值，几个时钟周期），纯为接口整洁保留。
->
-> **真正的收益**来自省掉两次 `sdsdup`（malloc+memcpy）和两次 `sdsfree`。此前用**交错 A/B**（同一脚本轮换两个二进制、各 8/5/5 轮取中位数）实测：
-
-| 值大小 | 默认 SET QPS | steal SET QPS | steal 提升 | 结论 |
-|--------|-------------|--------------|-----------|------|
-| 8B | 70,808 | 72,055 | **+1.8%** | 几乎无差（噪声内）|
-| 32KB | 22,459 | 24,085 | **+7.2%** | 有明显收益 |
-| 128KB | 11,239 | 12,073 | **+7.4%** | 稳定收益 |
-
-```dsh-ui
-{"title":"argv 不释放优化 · 大值才划算","gap":12,"items":[{"type":"chart","kind":"line","series":[{"label":"steal 提升 %","data":[{"label":"8B","value":1.8},{"label":"32KB","value":7.2},{"label":"128KB","value":7.4}]}]},{"type":"callout","tone":"info","title":"结论：小值不值，但已默认开启（零成本）","content":"省掉的其实是两次 sdsdup 的 malloc+memcpy 和两次 sdsfree。8B 小值这两次拷贝 ~几十 ns，相比单命令 ~107µs 的固定开销可忽略，收益 0；但 32KB/128KB 大值省掉的是两次大 memcpy，砍掉 ~7% 的 SET 耗时。因为小值也不付出额外代价（无副作用、无泄漏、已 51/51 测试），所以直接把它设成了默认路径，省得再纠结编译开关。"}]}
-```
-
-> **一句话**：省几次系统调用（malloc/free）对实际效率帮助很小——真正贵的是那些大 memcpy。`Command` 薄包装（栈上几次赋值）纯为接口整洁，收益≈0；但 **steal 所有权无副作用、大值 +7%、小值不亏**，所以干脆做成了默认行为。
-
-#### 为什么 storage 原来要拷贝、steal 又怎么不悬空（所有权视角）
-
-`c->argv` 是**指针数组壳**（`malloc` 的 `sds*`），每个槽**指向**一块 `extract_bulk_content` 用 `sdsnewlen` 从 querybuf 独立 `malloc` 出来的数据 sds——两块不同的内存。命令一结束，`server.c` 就 `sdsfree(c->argv[i]) + free(c->argv)`：数组壳无条件归还，"仍归 server 所有"的数据 sds 也被释放。
-
-所以直接 `hashtable_set(s->ht, argv[1], argv[2])`（既不拷贝、也不转移）是**悬空 bug**：哈希表存的指针指向 `c->argv[1]` 指向的 sds，命令结束它就失效，下次 GET 读到已释放内存。避开它只有两条路，二选一——**本仓库只保留第二条**（深拷贝版 `storage_set` 已删除）：
-
-| | 存进哈希表的是 | 命令结束后原数据 sds 会怎样 | 结果 |
-|---|---|---|---|
-| **storage_set（旧，已删除）** | `sdsdup` 拷的新一份（与 c->argv 无关） | 原 sds 被 server 释放 | 哈希表持拷贝，安全 |
-| **storage_set_steal（现用）** | `argv[i]` 指向的原 sds 本身 | 已被接管，槽置 NULL 不再释放 | 哈希表持原件，安全 |
-
-**SET 和 ZADD 现在都走 steal**：`storage_set_steal` 把哈希表的 key/value 直接接管，`zset_add` 不再 sdsdup、直接把 member 交给跳表（`skiplist_add` 直接持有，duplicate/同分/OOM 路径自行 `sdsfree`），命令层都各自把 `argv[i]` 置 NULL。
-
-关键纪律：**每块 sds 恰好一个 owner**。steal 是"改 owner + 把登记表那格清掉"（`argv[1]=argv[2]=NULL` / `argv[3]=NULL`，`sdsfree(NULL)` 安全 no-op），既不 double-free 也不悬空；哈希表/跳表在 duplicate/同分/OOM 拒绝路径自行释放传入的 sds，同样闭环。ASAN + LeakSanitizer 全路径零泄漏即证。
-
----
-
-### 11. 渐进式 rehash：把 O(n) 长停顿摊成 O(1) 小步
-
-> 你问：**"这个的收益在哪里？"** 先跑了 `bench/bench_rehash.c` 量化瓶颈，再实现，再用受控 A/B 检验实现里那个"聪明设计"是否真的有效。
-
-#### 11.1 瓶颈是真实存在的（不是背结论）
-
-`bench_rehash` 逐次记录**每一次插入**的耗时，看分布而不是平均值：
-
-| N | 一次性搬迁·最大停顿 | 渐进式·最大停顿 | 改善 |
-|---|---|---|---|
-| 100,000 | 3.4 ~ 3.7 ms | 0.041 ~ 0.047 ms | ~78x |
-| 1,000,000 | 23.9 ~ 29.4 ms | 0.198 ~ 0.224 ms | ~120x |
-| 2,000,000 | 54.7 ~ 58.0 ms | 0.414 ~ 0.523 ms | ~115x |
-
-**关键不是"快了多少倍"，而是趋势**：一次性搬迁的停顿随 N **线性增长**（3.4→58ms，N 涨 20 倍停顿涨约 17 倍）—— 这是 O(n) 的签名；渐进式维持在**亚毫秒**，不随 N 量级跃升。所以改善倍数**随 N 增大**（~78x → ~120x）。
-
-对服务端而言：24ms 意味着"几千个请求超时"，0.4ms 意味着"一个请求慢一点"。
-
-```dsh-ui
-{"title":"渐进式 rehash · 最大单次停顿随 N 的变化","gap":12,"items":[{"type":"chart","kind":"line","series":[{"label":"一次性搬迁 (ms)","data":[{"label":"10万","value":3.5},{"label":"100万","value":23.9},{"label":"200万","value":58.0}]},{"label":"渐进式 (ms)","data":[{"label":"10万","value":0.044},{"label":"100万","value":0.21},{"label":"200万","value":0.47}]}]},{"type":"callout","tone":"warning","title":"读它：看形状，不看绝对值","content":"一次性搬迁（蓝）随 N 近似线性上升 —— 这就是 O(n)，永远治不好。渐进式（绿）几乎贴着横轴 —— 这是 O(1)。两条线【剪刀差】越来越大，正是「改善倍数随 N 增大」的原因。VM 环境噪声大，绝对值会波动，但形状稳定。"}]}
-```
-
-#### 11.2 ★ 路径 A/B 为什么是「二选一」——一次连续误判三次的记录
-
-**先说结论**：Redis `unstable` 的 `_dictRehashStepIfNeeded` 就是 `if/else` 互斥的：
-
-```c
-if ((long)visitedIdx >= d->rehashidx && d->ht_table[0][visitedIdx]) {
-    _dictBucketRehash(d, visitedIdx);      /* 路径 A：CPU cache 友好 */
-} else {
-    dictRehash(d,1);                       /* 路径 B：按 rehashidx 顺序搬 */
-}
-```
-
-我最初的实现写成 `if (...) { 搬; return; }` —— 与它**语义完全等价**。
-我却一度把它"修"成了"两条路径都执行"（叠加），并写进文档说原版是 bug。**那是偏离上游，不是修复。**
-
-**为什么二选一才是对的**：一次操作只搬一个桶，**单次操作的延迟上限**被钉死在一个桶的搬迁成本上。
-叠加版一次可能搬两个桶，rehash 收敛更快（旧表残余 11,692 vs 55,952）——
-**QPS 确实会涨**（更早退出双表状态），**但单次最坏延迟上限翻倍**。
-服务端更在意后者，所以 Redis 选二选一。
-
-```dsh-ui
-{"title":"二选一 vs 叠加：真正的取舍","gap":12,"items":[{"type":"table","columns":["写法","单次搬几个桶","单次延迟上限","rehash 收敛","旧表残余(30万)"],"rows":[["二选一（Redis / 本项目）","≤ 1","低","慢","55,952"],["叠加","≤ 2","可能翻倍","快","11,692"]],"types":["text","text","text","text","text"]},{"type":"callout","tone":"info","title":"一句话","content":"叠加版「更快搬完 → 更早退出双表状态 → 后续查找更便宜」，所以 QPS 涨；代价是单次操作可能搬两个桶，最坏延迟上限抬高。这是【最坏延迟 vs 收敛速度】的取舍，不是一个对一个错。"}]}
-```
-
-**我三次误判的过程**（记在这里因为「用真实数据支撑的错误结论」最难被质疑）：
-
-| 轮次 | 我的结论 | 错在哪 |
-|---|---|---|
-| 1 | "关掉路径 A 更快 → 路径 A 没用" | A/B 副本里我把 `else` 写成了"只查旧表"，测试本身错了 |
-| 2 | "叠加版更快 → Redis 的 if/else 是 bug" | 叠加快是因为总工作量更大，不是效率更高 |
-| 3 | "用 rehashidx 判断查哪张表会漏查 8.6%" | 我的规则漏写"跳过旧表后仍要查新表"，测的是我自己的 bug |
-
-**共同错因：拿一个局部的性能数字，去否定一个我还没理解的设计。**
-转折点是去读 Redis 真实源码，发现人家有路径 A、而且是 `if/else`。
-
-#### 用 rehashidx 决定查哪张表（成立，但收益在噪声内）
-
-二选一结构保住了一条不变量：**旧表 `[0, rehashidx)` 区间恒为空**。于是查找可以省一次：
-
-```
-idx = hash % old_capacity
-  idx <  rehashidx → 旧桶已搬空 → 跳过旧表，直接查新表
-  idx >= rehashidx → 旧桶还没搬 → 先查旧表（命中率 84.4%），再查新表
-```
-
-⚠ 陷阱：`idx < rehashidx` 时**必须仍然查新表** —— rehash 期间新插入的 key 只进新表，
-而它的 idx 可能 `< rehashidx`。写成"跳过旧表就返回"会漏掉所有新键。
-
-**正确性**：新增白盒对拍测试 `tests/test_lookup_order.c`（oracle = "两张表都查"的笨写法）：
-
-```dsh-ui
-{"title":"test_lookup_order 对拍结果","gap":12,"items":[{"type":"table","columns":["检查项","结果"],"rows":[["① `idx < rehashidx` 位置的旧表非空次数","0（8.2 亿次检查）"],["② 30 万 key 全量对拍不一致","0"],["③ rehash 中 add/find/delete 失败","0"],["④ 20 万 key 混合负载对拍不一致","0"]],"types":["text","text"]}]}
-```
-
-**性能：收益在噪声内，如实报告。**
-
-| 版本 | find 中位数（交叉 7 轮） |
-|---|---|
-| 新版（idx 判定） | 44.0 ns/op |
-| 旧版（两张表都查） | 45.6 ns/op |
-| 差异 | **−3.5%（噪声内）** |
-
-**为什么省了 81% 的旧表访问却没变快**：被省掉的那些访问**本身几乎不花钱** ——
-实测旧版查旧表时 **81.3% 落在空槽**（空槽 = 取模 + 一次访存 + 判空，无链表遍历）。
-真正贵的是命中非空槽后的链表遍历，那部分省不掉。
-
-> **所以保留它的理由是「结构清晰 + 与上游对齐」，不是性能。** 它无负作用，但不该宣传成提速。
-
-#### 11.3 能力边界：渐进式消不掉什么
-
-残余尖刺经探针逐次定位，**精确发生在 `free(旧表)` 那一次**。实测 `free` 一张桶数组（纯内存操作，与元素内容无关）：
-
-| 表大小 | `free` 耗时 |
-|---|---|
-| 1 MB (cap=131072) | 0.049 ms |
-| 8 MB (cap=1048576) | 0.389 ms ← 100 万键场景 |
-| 32 MB (cap=4194304) | 1.975 ms |
-
-这是**内核释放页表**的成本。**渐进式 rehash 消不掉它**，只能压低它的相对占比。要连它一起消掉得把旧表切块分次释放 —— 更激进，本项目与 Redis 都没做。
-
-> **诚实结论**：渐进式 rehash 消除的是「**O(n) 的搬运停顿**」，不是「**O(表大小的) 内存管理停顿**」。
-
-**还有一个固有债务**：搬迁由"操作次数"驱动，而插入本身在持续产生搬迁需求。实测插入 30 万 key 结束时旧表仍剩 **55,952 个元素**（`rehashidx` 只扫到 123,304 / 524,288）。这是"**把长停顿换成持续小开销**"的必然代价 —— 换取的正是"单次操作最多搬一个桶"的低延迟上限。
-
-#### 11.4 复现方式
+### 编译与运行
 
 ```bash
-make benchrehash RUN=1000000    # 逐次插入延迟分布 + 尖刺定位
-make benchrehash RUN=2000000    # 换 N 跑，观察最大停顿是否随 N 线性增长
+make                      # 生成 mini-redis
+./mini-redis              # 默认监听 0.0.0.0:6379
+./mini-redis 6380         # 指定端口（优先级：命令行 > PORT 环境变量 > 6379）
 ```
 
-> 看 `最大` 那一行。**线性增长 → 一次性搬迁；亚毫秒且不随 N 爆涨 → 渐进式已达成。**
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `PORT` | 6379 | 监听端口（命令行参数优先级更高） |
+| `CLIENT_TIMEOUT` | 0（不超时） | 客户端空闲多少秒后被断开 |
+
+### 用 redis-cli 连接
+
+```bash
+$ redis-cli -p 6379
+127.0.0.1:6379> PING
+PONG
+127.0.0.1:6379> SET name mini-redis
+OK
+127.0.0.1:6379> GET name
+"mini-redis"
+127.0.0.1:6379> ZADD board 100 alice
+OK
+127.0.0.1:6379> ZRANGE board 0 -1
+1) "alice"
+```
+
+### 常用 make 目标
+
+| 命令 | 作用 | 耗时 |
+|---|---|---|
+| `make` | 编译 | ~5 s |
+| `make test` | 编译 + 集成回归（54 项） | ~1 min |
+| `make unit` | 单元测试（6 个套件） | ~1 min |
+| `make check` | = `unit` + `test` | ~2 min |
+| `make asan` | 用 ASan/UBSan 重编（内存与 UB 检测） | ~10 s |
+| `make prodtest` | 生产环境模拟测试（4 组） | ~10 min |
+| `make prodtestquick` | 同上，缩短规模 | ~2 min |
+| `make abtest` | 准备 A/B 对比环境（阻塞版 vs epoll 版） | ~10 s |
+| `make benchrehash` | 渐进式 rehash 微基准 | ~1 min |
+| `make benskip` | 跳表 span 微基准 | ~1 min |
+| `make clean` | 清理构建产物 | — |
 
 ---
 
-### 12. 一页汇总：所有关键数字
+## 2. 完整代码调用图
 
-> 前面 11 节是过程与依据，这里是**结论表**。想看细节回上面找对应小节。
+**这是理解本项目最快的一张图。** 每条边都是一次真实调用，
+每个方框都标注了它所在的文件和职责。
 
-```dsh-ui
-{"title":"mini-redis 关键性能数字一览","gap":14,"items":[{"type":"table","columns":["维度","无 SDS 基线","SDS 当前版","结论"],"rows":[["小命令 SET (QPS)","136,534","54,674","无 SDS 快 2.5x"],["小命令 GET (QPS)","166,999","55,477","无 SDS 快 3x"],["大值 SET 载荷","≥1KB 崩溃","39→1,674 MB/s","SDS 专属战场"],["SET 8B 延迟 avg (µs)","82","120","无 SDS 低 ~30%"],["SET 128KB 延迟 avg (µs)","崩溃","192","仅 SDS 存活"],["二进制安全(含 \\0)","❌ 截断成 A","✅ 原样存取","SDS 胜负手"],["容量上限","1KB(固定缓冲)","无上限","SDS 胜负手"]],"types":["text","text","text","text"]},{"type":"callout","tone":"success","title":"一句话总结","content":"无 SDS 是「快但脆」：小命令快 3 倍、延迟低 30%，却扛不住 >1KB 的数据和含 \\0 的二进制值。SDS 是「稳而全」：牺牲一点小命令速度，换来二进制安全 + 任意大小 + 大数据吞吐 + 防溢出。"}]}
+```mermaid
+flowchart TB
+    subgraph ENTRY["① 入口层 — src/main.c"]
+        M1["main()"]
+        M2["create_server_socket()<br/>bind + listen"]
+        M3["aeCreateEventLoop(MAX_CLIENTS+16)"]
+        M4["aeCreateTimeEvent(100ms, serverCron)"]
+        M5["aeCreateFileEvent(listen_fd,<br/>acceptTcpHandler)"]
+        M6["aeMain(el)"]
+    end
+
+    subgraph AE["② 事件循环层 — src/ae.c"]
+        A1["aeMain()<br/>while(!stop)"]
+        A2["aeProcessEvents()"]
+        A3["beforesleep()<br/>flush 输出缓冲"]
+        A4["aeSearchNearestTimer()<br/>算 timeout"]
+        A5["aeApiPoll()"]
+        A6["分发 fired[]<br/>调 rfileProc/wfileProc"]
+        A7["processTimeEvents()"]
+    end
+
+    subgraph BACKEND["③ epoll 后端 — src/ae_epoll.c"]
+        B1["epoll_create / epoll_ctl / epoll_wait"]
+    end
+
+    subgraph NET["④ 网络驱动层 — src/networking.c"]
+        N1["acceptTcpHandler()"]
+        N2["readQueryFromClient()"]
+        N3["writeToClientRaw()"]
+        N4["freeClient()"]
+        N5["serverCron()"]
+        N6["beforeSleep()"]
+    end
+
+    subgraph PROTO["⑤ 解析层 — src/parser.c"]
+        P1["processInputBuffer()"]
+        P2["processMultibulkBuffer()"]
+        P3["processInlineCommand()"]
+    end
+
+    subgraph PROTO2["⑥ 语法单元层 — src/protocol.c"]
+        Q1["parse_multibulk_header()<br/>parse_bulk_header()<br/>extract_bulk_content()"]
+    end
+
+    subgraph CMD["⑦ 命令层 — src/commands.c"]
+        C1["handle_command()"]
+    end
+
+    subgraph REP["⑧ 响应编码层 — src/reply.c"]
+        R1["send_response()<br/>追加进 c->outbuf"]
+        R2["send_simple_string() / send_error()<br/>send_integer() / send_bulk_string() ..."]
+    end
+
+    subgraph STORE["⑨ 存储层"]
+        S1["storage.c — 键值表"]
+        S2["dict.c — 哈希表 + 渐进式 rehash"]
+        S3["zset.c / skiplist.c — 有序集合"]
+        S4["sds.c — 动态字符串"]
+    end
+
+    M1 --> M2 --> M3 --> M4 --> M5 --> M6
+    M6 --> A1
+
+    A1 --> A2
+    A2 --> A3
+    A3 --> N6
+    A2 --> A4
+    A2 --> A5
+    A5 --> B1
+    A2 --> A6
+    A2 --> A7
+    A5 -.->|"epoll_wait 超时"| A7
+    A7 -->|"函数指针 timeProc"| N5
+
+    A6 -->|"listen fd 可读"| N1
+    A6 -->|"客户端 fd 可读"| N2
+    A6 -->|"客户端 fd 可写"| N3
+
+    N1 -->|"注册 AE_READABLE"| A2
+    N2 --> P1
+    P1 --> P2
+    P1 --> P3
+    P2 --> Q1
+    P3 --> Q1
+    P2 --> C1
+    P3 --> C1
+    C1 --> S1
+    C1 --> S3
+    S1 --> S2
+    S3 --> S2
+    S3 --> S4
+    S1 --> S4
+    C1 --> R2
+    R2 --> R1
+    R1 -.->|"只入队，不发"| N6
+
+    N2 -->|"协议错误 / 对端关闭"| N4
+    N3 -->|"写错误"| N4
+    N5 -->|"空闲超时"| N4
+    N4 -->|"撤关注"| A2
+
+    N5 -.->|"返回 100ms"| A7
+    A7 -.->|"改 when"| A4
 ```
 
-```dsh-ui
-{"title":"跳表算法层 · 改造前 vs 现在 (ns/op)","gap":12,"items":[{"type":"table","columns":["操作","旧版 n=3万","新版 n=40万","复杂度"],"rows":[["find (member 点查)","726,687","261","O(n) → O(1)"],["range 跳到表尾","1,249,593","86","O(n) → O(log n)"],["range 跳到表中间","513,229","82","O(n) → O(log n)"],["get_rank","—","2,304","O(log n)"],["add (更新分数)","—","4,128","O(log n)"]],"types":["text","text","text","text"]},{"type":"callout","tone":"success","title":"要点","content":"旧版随表大小线性增长（1万→3万涨 6 倍），新版从 1 万到 40 万几乎不变 —— 这才是跳表该有的复杂度。"}]}
+### 图例
+
+| 标记 | 含义 |
+|---|---|
+| **实线箭头** | 一次函数调用 |
+| **虚线箭头** | 通过函数指针回调（`rfileProc` / `wfileProc` / `timeProc`），或返回值回传 |
+| **① ~ ⑨** | 分层编号，数字越大越靠近业务；依赖方向单向（大编号 → 小编号） |
+
+### 三条关键链路
+
+```mermaid
+flowchart LR
+    X1["epoll_wait 报<br/>listen fd 可读"] --> X2["acceptTcpHandler"] --> X3["accept + set_nonblocking<br/>+ create_client + clients_add"] --> X4["aeCreateFileEvent<br/>(AE_READABLE)"]
 ```
 
-```dsh-ui
-{"title":"渐进式 rehash · 关键数字","gap":12,"items":[{"type":"table","columns":["N","一次性搬迁 max","渐进式 max","改善"],"rows":[["100,000","3.5 ms","0.044 ms","~78x"],["1,000,000","23.9 ms","0.21 ms","~120x"],["2,000,000","58.0 ms","0.47 ms","~115x"]],"types":["text","text","text","text"]},{"type":"callout","tone":"warning","title":"两个诚实的边界","content":"① 残余尖刺是 free(旧表)：8MB 表 ≈ 0.39ms，内核页表释放成本，渐进式消不掉。② 路径 A/B 是【二选一】（对齐 Redis）：单次操作最多搬一桶，最坏延迟最小；代价是旧表残余多（30 万 key 剩 5.6 万）。"}]}
+```mermaid
+flowchart LR
+    Y1["epoll_wait 报<br/>fd 可读"] --> Y2["readQueryFromClient"] --> Y3["processInputBuffer<br/>解析 + 执行"] --> Y4["handle_command"] --> Y5["send_* 写进 outbuf<br/>【只入队】"]
+    Y5 -.->|"下一轮 beforesleep"| Y6["writeToClientRaw<br/>【真正 write】"]
 ```
 
-```dsh-ui
-{"title":"测试与质量","gap":12,"items":[{"type":"list","items":[{"title":"集成回归 51/51","desc":"基础命令 / 有序集合 / 边界异常 / 协议解析（半包粘包）/ 二进制安全 / 超大值 / 断连退出"},{"title":"单元测试 5/5","desc":"SDS · dict · skiplist · skipspan(458 项对照) · zset"},{"title":"ASan + UBSan + LSan 零泄漏","desc":"make asan 全路径验证，steal 所有权路径也无 double-free/悬空"}]}]}
+```mermaid
+flowchart LR
+    Z1["协议错误 / 对端关闭<br/>写错误 / 空闲超时"] --> Z2["freeClient"] --> Z3["⓪ flush outbuf"] --> Z4["① DEL READABLE<br/>+ WRITABLE"] --> Z5["② close(fd)"] --> Z6["③ clients_remove"] --> Z7["④ 释放内存"]
 ```
+
+> ★ **链路 2 是理解本项目的关键**：`send_*` 只把数据**追加进 outbuf 就返回**，
+> 真正 `write` 发生在**下一轮循环的 `beforesleep`**。
+> 这是「非阻塞 + 输出缓冲」与「阻塞直发」最本质的区别 ——
+> 好处是攒批（一条 `+OK` 从 3 次 `write` 降到 1 次）且永不阻塞，
+> 代价是「数据已就绪但未发出」这个状态要由我们自己维护。
 
 ---
 
-## 📈 附录：早期性能记录
+## 3. 项目结构
 
-> 以下为**早期开发阶段**的压测记录（动态数组时期、哈希表刚上线时），保留作为演进轨迹。
-> 当时的机器/客户端与当前 §压测数据 不同，**不要与上面的数字直接对比**。
+```
+mini-redis/
+├── src/                    3936 行
+│   ├── main.c              进程入口：建 socket、建事件循环、注册回调、进 aeMain
+│   │
+│   ├── ae.c          ★     事件循环骨架（移植自 Redis unstable）
+│   ├── ae_epoll.c    ★     epoll 后端：唯一的 epoll_* 调用点
+│   │
+│   ├── networking.c  ★     网络驱动层：所有事件回调 + 全局状态 g_server
+│   ├── server.c            连接生命周期 + 服务器 socket
+│   ├── reply.c             响应编码（永不 write，只入队 outbuf）
+│   ├── parser.c            三层协议解析
+│   ├── protocol.c          单语法单元解析
+│   │
+│   ├── commands.c          命令分发（8 个命令）
+│   ├── storage.c           键值存储接口
+│   ├── dict.c              哈希表 + 渐进式 rehash
+│   ├── skiplist.c          跳表（带 span）
+│   ├── zset.c              有序集合
+│   ├── sds.c               动态字符串
+│   └── anet.c              socket 选项封装
+│
+├── include/                1384 行
+│   ├── ae.h                ★ 事件循环接口（含定时器）
+│   ├── server.h            ★ Client / Server 结构体
+│   ├── util.h              BACKLOG / set_nonblocking
+│   └── 其余为各模块头文件
+│
+├── tests/                  6 个单元测试套件
+├── bench/                  压测工具（Python + C）
+├── docs/                   配套设计文档（中文文件名）
+├── test.sh                 集成回归（54 项）
+└── Makefile
+```
 
-### 附-1. 哈希表 vs 动态数组（单连接，原生 C 客户端）
+### 分层与依赖方向
 
-| 数据量 | 动态数组（O(n)） | 哈希表（O(1)） | 提升倍数 |
-|--------|-----------------|---------------|----------|
-| 100 条 SET | 1.06 秒 | < 0.01 秒 | > 100x |
-| 1,000 条 SET | 9 秒 | 0.06 秒 | 150x |
-| 10,000 条 SET | 崩溃（double free） | 0.63 秒 | ∞ |
-| 100,000 条 SET | 推算 ~25 小时 | 6.3 秒 | ~14,000x |
-| 1,000,000 条 SET | 不可完成 | 63 秒 | ∞ |
+```mermaid
+flowchart TB
+    L7["① 资源层<br/>server.c / main.c"]
+    L6["②③ 事件循环层<br/>ae.c / ae_epoll.c"]
+    L5["④ 网络驱动层<br/>networking.c"]
+    L3["⑤⑥ 解析层<br/>parser.c / protocol.c"]
+    L4["⑧ 响应编码层<br/>reply.c"]
+    L2["⑦ 命令层<br/>commands.c"]
+    L1["⑨ 存储层<br/>sds / dict / skiplist / zset / storage"]
 
-> 动态数组每次插入遍历全部元素，O(n²) 累积效应使其在大数据量下完全不可用；哈希表 O(1) 插入 + 自动扩容，百万级依旧秒级。
+    L7 --> L6
+    L7 --> L5
+    L6 --> L5
+    L5 --> L3
+    L5 --> L4
+    L3 --> L2
+    L4 --> L1
+    L2 --> L1
+```
 
-### 附-2. 哈希表 SET/GET 延迟（自研 C 客户端，10 万次，单连接）
+> ★ **依赖是单向的**：`parser.c` 和 `reply.c` 里**零 socket 调用、零 ae 调用**，
+> 可用下面这条命令验证（已排除注释行）：
+>
+> ```bash
+> grep -nE "\b(read|write|accept|close|epoll_[a-z]+|ae[A-Z])\s*\(" src/parser.c src/reply.c \
+>   | grep -vE "^\S+:[0-9]+:\s*(\*|//|/\*)"
+> # 预期：无输出
+> ```
+>
+> 这样「改协议解析规则」不必重编网络层，「换网络模型」也不必碰解析层。
 
-| 命令 | QPS | P50 延迟 | P99 延迟 |
-|------|-----|----------|----------|
-| SET | 2535 | 0.36 ms | 0.56 ms |
-| GET | 2427 | 0.39 ms | 0.57 ms |
+---
 
-![延迟CDF](assets/benchmark/latency_cdf.png)
+## 4. 请求生命周期
 
-### 附-3. 有序集合 / 跳表压测（10 并发，10 万请求）
+以一条 `SET name mini-redis` 为例：
 
-| 命令 | QPS | 说明 |
-|------|-----|------|
-| PING_INLINE | 2460 | 连接存活检测 |
-| SET | 2535 | 字符串存储 |
-| GET | 2427 | 字符串查询 |
-| SADD | 2384 | 集合添加（类比 ZADD） |
-| LRANGE_100 | 2010 | 范围查询（类比 ZRANGE） |
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant K as 内核
+    participant AE as ae.c
+    participant NET as networking.c
+    participant P as parser.c
+    participant CMD as commands.c
+    participant R as reply.c
+    participant S as storage.c
 
-> 🟢 **此处的「O(log n) 几乎接近 O(1)」已在后续改造中真正落地**：当初源码复查发现问题——`skiplist_find` 是第 0 层线性扫描（O(n)）、ZADD 每次插入又先调一次 find 查重，导致 ZADD/ZSCORE/ZREM 实际是 O(n)。现已补上 Redis 同款改造（`SkipListLevel.span` + member→node 哈希索引）：find 变 O(1)、range/get_rank 变 O(log n)。算法层实测见「压测数据 §9 跳表」（旧版 n=3 万时 find 727µs / range 到尾 1.25ms，新版 40 万成员下 find 261ns / range 到尾 86ns）。
+    C->>K: *3\r\n$3\r\nSET\r\n...
+    K->>AE: epoll_wait 返回（fd 可读）
+    AE->>NET: rfileProc = readQueryFromClient
+    NET->>K: read(fd, buf, 4096)
+    K-->>NET: 26 字节
+    NET->>NET: 更新 c->lastinteraction
+    NET->>NET: 追加进 c->querybuf
+    NET->>P: processInputBuffer(c, store, zset)
+    P->>P: 状态机解析出 argv = [SET, name, mini-redis]
+    P->>CMD: handle_command(c, cmd, store, zset)
+    CMD->>S: storage_set("name", "mini-redis")
+    S-->>CMD: OK
+    CMD->>R: send_simple_string(c, "OK")
+    R->>R: sdscatlen(c->outbuf, "+OK\r\n")
+    Note over R: 到此为止，一个字节都没发出去
+    R-->>P: 返回
+    P-->>NET: 返回
+    NET-->>AE: 返回
+    Note over AE: 本轮结束，进入下一轮
+    AE->>NET: beforesleep → beforeSleep(el)
+    NET->>K: writeToClientRaw → write(fd, "+OK\r\n")
+    K->>C: +OK\r\n
+```
 
-## 🧠 核心技术点
+### 四个常被问到的细节
 
-**已实现**
+| 问题 | 答案 |
+|---|---|
+| 为什么 `send_*` 不直接 `write`？ | 非阻塞 `write` 遇 `EAGAIN` 只能发出去一部分；剩余数据不存起来就是**发送半包**。 |
+| 一次 `read` 只读 4096 字节，大命令怎么办？ | epoll 用**水平触发（LT）**：没读完内核会继续通知，回调会再次被调。 |
+| 客户端发一半（半包）会怎样？ | 状态机把进度存在 `c->qb_pos` / `multibulklen` / `bulklen` 里，下次从断点续解。 |
+| 一个客户端发很多命令会占满 CPU 吗？ | 会 —— `processInputBuffer` 的 `while` 循环**没有限流**，属已知局限（Redis 有限制）。 |
 
-- TCP 服务器（socket/bind/listen/accept）
-- RESP 协议解析（multibulk + inline 状态机，半包/粘包处理）
-- **SDS 简单动态字符串**（5 档 header、二进制安全、自动扩容）
-- **通用哈希表 `dict`**：djb2 + 链地址法；key/value 为 `void*` + `dictType` 函数表（C 版 vtable），可存任意类型、销毁策略由调用方决定（设计笔记见 `docs/dict-design.md`）
-- **渐进式 rehash**：双表 + `rehashidx` + **路径 A/B 二选一**（对齐 Redis `_dictRehashStepIfNeeded`：路径 A 搬本次访问的桶，cache 友好；单次操作最多搬一桶以保证最坏延迟）+ `old_used` 计数做完成判定；查找用 `rehashidx` 判断该查哪张表 —— 实测 200 万键最大停顿 **约 58ms → 约 0.47ms**（`make benchrehash`）
-- 哈希表替代动态数组，性能提升 > 10,000 倍
-- 有序集合（ZADD/ZRANGE/ZREM/ZSCORE）基于跳表，已做两轮 Redis 对齐：① `span` 记跨度 → range/get_rank O(log n)；② member→node 哈希索引 → find O(1)（ZADD 查重不再 O(n)），且索引复用通用 `dict`，不再重复实现哈希表
-- valgrind 零内存泄漏
-- SIGINT 信号处理，优雅退出
-- 分段直发 send 层，无不定长固定数组
+---
 
-**待实现**
+## 5. 测试与验证
 
-- AOF 持久化
-- 多客户端并发（epoll）← 这是「能演示」到「能服务」的分水岭，优先级高于 AOF
-- 有序集合多 key 隔离（当前 `ZADD` 的 key 被忽略，见下）
-- `Client` 空闲超时、单连接缓冲上限、全局内存上限
-- 认证（AUTH）与绑定地址可配置（当前固定监听 0.0.0.0 且无认证）
+### 5.1 全量回归
 
-## 🔍 与 Redis 的协议兼容性差距
+```bash
+make check        # 单元 + 集成
+make asan         # 内存检测
+```
 
-按当前实现，准确说法是「**实现了 RESP 编码 + 8 个命令的子集**」。逐条差距：
+| 测试 | 数量 | 内容 |
+|---|---|---|
+| **集成回归**（`test.sh`） | **54/54 ✅** | 连接 / 基本命令 / 错误处理 / 有序集合 / 边界 / 参数上限 / 二进制安全 / 大值 / 断连 / 并发 / 优雅退出 |
+| **单元测试**（`tests/`） | **6/6 ✅** | `test_sds` `test_dict` `test_skiplist` `test_zset` `test_skipspan` `test_lookup_order` |
+| **ASan / UBSan / LSan** | **零泄漏 ✅** | AddressSanitizer + UndefinedBehaviorSanitizer + LeakSanitizer |
+| **编译告警** | **0** | `-Wall -Wextra` |
 
-| 命令 | 当前行为 | 真实 Redis | 影响 |
-|------|---------|-----------|------|
-| `ZADD` | `key` 被忽略，**所有有序集合共享全局单例** | 按 key 隔离 | **高**：`ZADD a 1 x` 与 `ZADD b 2 y` 之后，`ZRANGE a 0 -1` 会同时看到 x 和 y |
-| `ZADD` | 恒回 `+OK` | 回 `:1`（新增）/ `:0`（更新分数） | 中：脚本按返回值判分会出错 |
+### 5.2 生产环境模拟测试
+
+```bash
+make abtest          # 准备 A/B 环境（阻塞版从 git 历史导出后编译）
+make prodtest        # 或 make prodtestquick
+```
+
+**A（阻塞版）** = 提交 `c49f44c`（改造前：`accept` 一个就陷进读循环）
+**B（epoll 版）** = 当前工作区
+
+> ★ A 从 git 历史导出而**不在工作区留副本** —— 留副本就要同步维护两份代码，
+> 而 A 的全部价值只是「作为对照被测量一次」。
+
+#### A 组 · 正确性：17/17 ✅
+
+| 测试项 | 结果 |
+|---|---|
+| 基础命令（PING / SET / GET / DEL / 未知命令 / nil） | ✅ 6/6 |
+| 二进制安全（含 `\0`、含 `\r\n`、`0xFF`、1KB 随机、320KB） | ✅ 5/5 |
+| inline 命令（nc/curl 风格） | ✅ |
+| **粘包**：一次发 4 条命令 | ✅ 4 条全部正确响应 |
+| **半包**：逐字节发送（间隔 1ms） | ✅ 仍能正确解析 |
+| 超限参数个数（`*2000`）被拒绝 | ✅ `-ERR protocol error` |
+| **并发一致性**：50 条连接共享同一份存储 | ✅ 可交叉读取 |
+
+#### B 组 · 健壮性：8/8 ✅
+
+| 攻击/异常场景 | 结果 |
+|---|---|
+| 20 次 RST 强断（不读回复就关闭） | ✅ 存活（SIGPIPE 回归） |
+| 发送垃圾字节 `\x00\x01\x02\xff` × 100 | ✅ 不崩溃 |
+| 超长无终止符输入（累计 3.2 MB） | ✅ 被 `MAX_QUERYBUF` 限制，不 OOM |
+| 声明 512 MB 的 bulk 但不发数据（slowloris 式） | ✅ 其他连接不受阻塞 |
+| **慢客户端隔离**：A 只写不读，另 50 条连接 | ✅ 50/50 正常 |
+| 突发 200 次连断 | ✅ 无 fd 泄漏 |
+| 空闲超时（`CLIENT_TIMEOUT=2`） | ✅ 空闲被踢，活跃 8/8 不受影响 |
+| 并发 800 连接同时保持 | ✅ 抽样 50/50 响应 |
+
+---
+
+## 6. 性能数据
+
+**环境**：12 核 · 15.9 GB · WSL2 · 内核 6.18.40.1 · 每点 3 次取中位数
+**客户端**：`bench/loadgen.c`（C 多进程，无 GIL 限制）
+
+> ⚠️ **为什么必须用 C 客户端**：Python 多线程受 GIL 限制，并发 ≥4 时
+> **客户端自己**成为瓶颈，曲线失真（实测症状：并发 2 比并发 4 还快）。
+> ★ 测量工具不能成为瓶颈，否则测的是工具而不是被测对象。
+
+### 6.0 先读这里：五组数字量的是不同的东西
+
+直接比大小会看着矛盾（11,827 vs 931,533 vs 2,506,833），
+因为它们**测的不是同一件事**：
+
+| 小节 | 测什么 | 单位 | 瓶颈在 |
+|---|---|---|---|
+| 6.1 | 1 条连接，调「连发多少条」 | 命令/秒 | depth 小→延迟；depth 大→单核 CPU |
+| 6.2 | N 条连接，depth 固定 100 | 命令/秒 | 4 连接后→单核 CPU |
+| 6.3 | 1 条连接，发一条等一条 | 微秒/次 | 网络往返，**不是**服务器算力 |
+| 6.4 | 写 320 KB 的大 value | 字节/秒 | 内存带宽 |
+| 6.5 | 阻塞版 vs epoll 版 | 倍率 | —— |
+
+> ★ 一句话：**6.1 问「单核最快能多快」，6.2 问「几条连接能喂饱它」，
+> 6.3 问「用户感受到多快」，6.5 问「为什么必须换」。**
+
+### 6.1 单连接：流水线深度的作用
+
+调「一次连发多少条再统一收回复」，把 TCP 往返的等待时间用起来：
+
+| depth | QPS | 单条耗时 | 相比上一档 |
+|---|---|---|---|
+| 1 | 11,827 | 84.6 µs | — |
+| 10 | 112,373 | 8.9 µs | 9.5× |
+| 100 | 976,300 | 1.02 µs | 8.7× |
+| 500 | **2,506,833** | 0.40 µs | **2.6×** ← 收益递减 |
+
+> ★ **depth=1 的 84.6 µs 与 6.3 的 p50（83.9 µs）是同一个数** —— 互相印证。
+> depth=1 时服务器只干了约 1 µs 的活，其余 98% 都在等网络，CPU 闲着。
+> 加大 depth 就是填满这段等待，到 depth=500 时等待已可忽略 →
+> **250 万就是这颗单核的算力上限。**
+>
+> ★ **收益递减点很关键**：100→500 只涨 2.6 倍（depth 涨 5 倍）。
+> 说明 depth=100 时瓶颈已从「延迟」变成「算力」—— 这正是 6.2 选 depth=100 的依据。
+
+### 6.2 多连接：要几条才能喂饱单核
+
+depth 固定 **100**（依据见 6.1），只增加连接数：
+
+| 并发 | QPS | 相对 1 连接 | 增涨 |
+|---|---|---|---|
+| 1 | 931,533 | 1.00× | — |
+| 2 | 1,711,233 | 1.84× | **+36 点（利用率）** |
+| 4 | 1,867,400 | 2.00× | +3 点 |
+| 8 | 1,866,366 | 2.00× | −0.3 点 |
+| 16 | 1,918,100 | 2.06× | —— |
+
+**结论：4 条连接就够了，之后加多少都不涨。** 机制（用
+`/proc/<pid>/stat` 的 CPU 记账 + `/proc/<pid>/status` 的上下文切换数实测）：
+
+| 并发 | CPU 利用率 | `epoll_wait` 每秒睡眠 |
+|---|---|---|
+| 1 | 55.6% | **10,766 次** |
+| 2 | 91.9% | 1,482 次 |
+| 4 | **95.0%** | **3 次** |
+| 8 | 94.7% | 0 次 |
+
+```mermaid
+flowchart LR
+    A["单连接：处理完一批就进 epoll_wait<br/>而数据还在 TCP 往返中"] --> B["★ 睡下，CPU 闲置 45%"]
+    C["多条连接：往返互相错开<br/>A 在处理时 B 的数据已就绪"] --> D["★ epoll_wait 总能立刻返回<br/>睡眠消失，利用率补满"]
+```
+
+> ★ **为什么是 4 而不是 2**：那 45% 的空洞不是均匀补上的 ——
+> 1→2 补掉大头（+36 点），2→4 补掉零头（+3 点），4 之后无差别。
+> **「4」是边际收益跌破噪声的经验位置，不是公式算出的临界点。**
+>
+> ★ **封顶 95% 而非 100%**：每轮都要重新进 `epoll_wait`，加上调度与内存拷贝。
+> （深挖这个成本的实验记录见 §6.6）
+>
+> ★ **命令越重，这个数越小**：命令重 → 单连接利用率高 → 离饱和更近。
+
+| value 大小 | 单连接利用率 | 饱和点 |
+|---|---|---|
+| 14 B（PING） | 55.6% | 4 条 |
+| 320 KB | 70.6% | 4 条 |
+| 1 MB | 83.6% | **2 条** |
+| 8 MB | 93.3% | **1~2 条** |
+
+> 趋势成立但**比直觉平缓**：命令重了 60 万倍，饱和点只从 4 降到 2。
+> 极限情况——若单连接就把 CPU 拉满（≈100%），这个数就是 **1**。
+>
+> ⚠️ 所以「4」是**「需要多少并发才能喂满单核」的量级**，
+> 不是「这台机器只能接 4 条连接」。
+
+### 6.3 延迟（串行 RTT，N=3000）
+
+发一条、等回复、再发下一条 —— 这是**用户能感知到的体感延迟**：
+
+| 分位 | 延迟 |
+|---|---|
+| 平均 | 97.9 µs |
+| p50 | **83.9 µs** |
+| p90 | 146.6 µs |
+| p99 | **211.3 µs** |
+
+> ★ p99 / p50 = **2.5×**，长尾不严重。
+>
+> ★ 这 83.9 µs 里服务器只占极小部分：按 6.1 的 depth=500（单条 0.40 µs）算只有 **0.5%**；
+> 即使按 6.2 的饱和值（单条 1.07 µs）算也只有 **约 1.3%**，其余全是往返与调度。
+> **要看服务器算力看 6.1，要看用户体验看 6.3。**
+
+### 6.4 大值吞吐
+
+| 场景 | 结果 |
+|---|---|
+| 320 KB 值串行写入 | **795 MB/s** |
+
+> 这条测的是协议层与缓冲层的搬运效率（解析 → 存进 sds → 序列化回复），
+> 用来确认大 value 不会出现数量级塌方。
+
+### 6.5 A/B：为什么必须换 epoll
+
+`bench/setup_ab.sh` 把阶段 1 的阻塞版从 git 历史 `c49f44c` 导出并现场编译到
+`/tmp/ab/blocking`，当前代码编到 `/tmp/ab/epoll`。**是真的两套可执行文件交替运行，
+不是模拟阻塞。**
+
+四个子测试逐层递进：**① ② 是「有没有」，③ 是「差多少」，④ 是「输在哪」。**
+
+**① 静默客户端能否卡死服务器**（连接 A 不发数据，看连接 B 能否被服务）
+
+| | 第 2 条连接能否服务 | 耗时 |
+|---|---|---|
+| 阻塞版 | ❌ **否** | 2004 ms（超时） |
+| epoll 版 | ✅ 是 | 1 ms |
+
+> 阻塞版 `accept` 后陷进那个连接的 `read`，对方不发数据就永久阻塞 → **整个服务器停摆**。
+
+**② 10 条并发连接中被服务的条数**（3 次取最好）
+
+| | 被服务 |
+|---|---|
+| 阻塞版 | **1/10** |
+| epoll 版 | **10/10** |
+
+> 取最好的一次上报 —— 这是对阻塞版最有利的取值，即便如此也只有 1/10。
+
+**③ 吞吐**
+
+| 场景 | 阻塞版 | epoll 版 | 倍率 |
+|---|---|---|---|
+| 并发 1 · depth=100 | 56,466 | **1,047,966** | **18.6×** |
+| 并发 4 · depth=100 | 53,366 | **2,018,666** | **37.8×** |
+
+> 阻塞版**并发 4 比并发 1 还略低** —— 它的吞吐全部来自「单连接流水线」，加连接毫无收益。
+> ★ 别读成「阻塞版很慢」：它单连接也能跑约 5 万 QPS，真正的问题在 ④。
+
+**④ 公平性 —— 这才是「瓶颈」的准确画像**
+
+8 条连接各跑 2 秒，看**每条各自完成了多少请求**（读分布形状，不读绝对值）：
+
+| | 各连接完成数（降序） | 被公平服务 | 离散度 CV |
+|---|---|---|---|
+| 阻塞版 | `[119600, 100, 100, 100, 100, 100, 100, 100]` | **1/8** | **2.63** |
+| epoll 版 | `[114800, 113300, 112100, 109900, ...]` | **8/8** | **0.02** |
+
+> ★ **离散度相差 130 倍**，比总 QPS 锋利得多。
+> 阻塞版的模式：**1 条连接跑满 12 万次，另外 7 条各完成 100 次后彻底卡死**
+> （那 100 次是建连后第一批来得及发出去的）。
+>
+> **为什么总 QPS 会掩盖它**：那条幸运连接把总吞吐撑到 5 万，看着「只是慢十几倍」，
+> 真相是**它一次只能服务一个人**。
+>
+> ⚠️ 这里用 Python 多线程（受 GIL 限制），所以**只能读分布形状，不能读绝对值**。
+
+**结论**
+
+| 阻塞版的瓶颈 | 表现 |
+|---|---|
+| 不是「慢」 | 单连接吞吐其实可观（约 5 万 QPS） |
+| 而是「一次只能服务一个连接」 | 8 条并发里只有 1 条在跑 |
+| 更糟的是「会被一个客户端卡死」 | 一条不发言的连接让服务完全不可用 |
+
+> ★ 本项目这类服务的本质是「同时等很多个连接，但每个连接大部分时间没事干」。
+> 阻塞式 `accept` + `read` **在结构上无法表达「同时等多个」** ——
+> 不是慢几倍，而是这个能力根本不存在。
+
+### 6.6 深挖：write 到底花多少时间
+
+「4 条连接封顶 95%」引出一个问题：**那 5% 是什么？**
+用独立工具 `bench/bench_syscall.c`（不经过 mini-redis）测出环境基线：
+
+| 测量项 | 中位数 |
+|---|---|
+| `write` 5 字节 → loopback | **5,285 ns** |
+| `write` 50 / 500 / 4096 字节 | 5,314 / 4,794 / 5,002 ns |
+| `read` 64 字节 | 1,146 ns |
+| `epoll_wait` 超时=0 | 740 ns |
+| `getpid`（syscall 地板价） | 635 ns |
+
+> ★ **write 的耗时与数据量无关**（5 字节 vs 4096 字节几乎一样）——
+> 说明是**每次调用的固定成本**，不是拷贝成本。
+> 5.3 µs 偏高（原生 Linux 通常 1~3 µs），是 **WSL2 要穿越 Hyper-V 边界**的代价。
+
+**服务器实测与基线对比**：
+
+| 场景 | 单次 write | 相对基线 |
+|---|---|---|
+| 环境基线（裸程序） | 5,285 ns | 1.0× |
+| 服务器·客户端读得慢 | 5,407 ns | **1.02×** |
+| 服务器·客户端全速读 | 13,248 ns | 2.5× |
+| 服务器·高并发压测 | 33,693 ns | 6.4× |
+
+**为什么会有差异——不是数据量，是「调用上下文」：**
+
+| write 前的工作量 | ① 冷 write | ② 紧接着的 write | 冷/热 |
+|---|---|---|---|
+| 无 | 4,066 ns | 4,067 ns | 1.00× |
+| 空转 2000 次 | 5,185 ns | 3,355 ns | 1.55× |
+| 空转 20000 次 | 21,860 ns | 6,507 ns | **3.36×** |
+
+> ★ **同一个 write，前后紧挨着做两次，差 3.4 倍。**
+> 多出来的 15.4 µs 不是处理数据，而是**让 write 看到它需要的内核状态**；
+> 第二次不用重做所以便宜。空转 0 时冷热一致 —— 没有前置工作就没有这个代价。
+>
+> ★ 服务器每轮的 write 都是**冷的**（前面刚做完 epoll_wait → read → 解析 → 执行），
+> 而基线程序紧循环只做 write，环境一直是热的。
+> **这才是 95% 封顶的真正来源**，也是并发越高 write 越慢的原因
+> （每轮干的事越多，把 write 的状态冲得越冷）。
+>
+
+
+### 6.7 一页汇总
+
+| 维度 | 结果 | 来自 | 回答什么问题 |
+|---|---|---|---|
+| 单连接峰值 | **2,506,833 QPS** | 6.1 | 这颗单核最快能多快 |
+| 喂饱单核所需连接数 | **约 4 条** | 6.2 | 几条连接能用满 CPU |
+| 并发峰值 | **约 1,900,000 QPS** | 6.2 | 加连接能否继续堆 |
+| 串行延迟 | p50 **83.9 µs** · p99 **211.3 µs** | 6.3 | 单条命令的体感延迟 |
+| 大值吞吐 | **795 MB/s** | 6.4 | 大数据搬运会不会塌方 |
+| epoll vs 阻塞（吞吐） | **18.6× ~ 37.8×** | 6.5③ | 差距有多大 |
+| epoll vs 阻塞（并发能力） | **1/10 → 10/10** | 6.5② | 并发能力有没有 |
+| epoll vs 阻塞（公平性 CV） | **2.63 → 0.02** | 6.5④ | 到底输在哪 |
+
+> ★ **读法**：前三行是「epoll 版有多快」，后三行是「为什么必须换」。
+>
+> ★ **三个数看着矛盾但都对**：
+> · 250 万（6.1）与 190 万（6.2）是**同一颗单核的两种测法** ——
+>   一个从「单连接压到最深」逼近，一个从「多连接堆到最满」逼近；
+>   6.2 略低只是因为 depth 停在 100。
+> · 83.9 µs（6.3）与 250 万 QPS 也不矛盾 ——
+>   前者是发一条等一条的体感延迟，后者是流水线灌满后的极限。
+> · 「4 条」是**需要多少并发才能喂满单核**的量级，**不是机器的连接数上限**。
+
+## 7. 与 Redis 的差距
+
+准确说法是「**实现了 RESP 编码 + 8 个命令的子集**」。
+
+### 7.1 命令语义差距
+
+| 命令 | 本项目 | 真实 Redis | 影响 |
+|---|---|---|---|
+| `ZADD` | `key` 被忽略，**所有有序集合共享全局单例** | 按 key 隔离 | **高**：`ZADD a 1 x` 后再 `ZADD b 2 y`，`ZRANGE a 0 -1` 会同时看到 x 和 y |
+| `ZADD` | 恒回 `+OK` | `:1`（新增）/ `:0`（更新） | 中 |
 | `ZADD` | 不支持 `NX/XX/GT/LT/CH/INCR` | 支持 | 中 |
-| `ZRANGE` | 不支持 `WITHSCORES` / `REV` / `BYSCORE` | 支持 | 中 |
-| `PING` | 无论参数个数恒回 `+PONG` | `PING msg` 回 bulk 字符串 | 中 |
+| `ZRANGE` | 不支持 `WITHSCORES/REV/BYSCORE` | 支持 | 中 |
+| `PING` | 恒回 `+PONG` | `PING msg` 回 bulk | 中 |
 | `SET` | 不支持 `EX/PX/NX/XX/GET` | 支持 | 低 |
 | `DEL` | 只支持单 key | 支持多 key | 低 |
-| `*0\r\n` | 视作协议错误并**断开连接** | 视作空命令，不断开 | 低 |
+| `*0\r\n` | 视作协议错误并**断开连接** | 视作空命令 | 低 |
 
-> 注：`test.sh` 中「12-arg PING (B3)」用例期望 `PONG`，是把上述不兼容行为固化成了期望值。
-> 若日后对齐 Redis（让 `PING msg` 回 bulk），该用例需要一并修改。
+> 注：`test.sh` 中「12-arg PING (B3)」用例期望 `PONG`，
+> 是把上述不兼容行为固化成了期望值。若日后对齐 Redis，该用例需一并修改。
 
-## 📝 开发日志
+### 7.2 服务能力差距
 
-**阶段 6：渐进式 rehash（当前）**
-
-- 先写 `bench/bench_rehash.c` **量化出瓶颈**：一次性搬迁在 100 万键时造成 **23.87ms** 的停顿，且随 N 线性增长（10万 3.71ms / 200万 57.99ms）—— 证明问题真实存在，不是背结论
-- 实现渐进式 rehash，按注释流程图的原始设计做**路径 A / 路径 B 分流**：
-  - **路径 A**：搬【本次访问的 key 所在的旧桶】（`vi = hash % old_capacity`）
-  - **路径 B**：搬 `rehashidx` 指向的下一个非空桶（顺序扫描，**唯一能推进 `rehashidx`、从而结束 rehash 的路径**）
-- `struct dict` 增加 `buckets_old` / `rehashidx` / `old_capacity` / `old_used` 四个字段
-- 效果：最大停顿从 **58ms → 亚毫秒**，改善倍数约 78x ~ 120x，且一次性搬迁随 N 线性增长而渐进式不随 N 量级跃升 —— 这正是 O(n)→O(1) 的签名
-- 新增单测第 7 节专门测"搬迁进行中"的正确性（对拍参考数组）；集成 51/51、单元 5/5、ASan/UBSan/LSan 零泄漏
-
-**★ 一次连续误判三次的记录（比实现本身更值得记）**
-
-我一度认为"路径 A 和路径 B 应该叠加执行"，并写进文档说二选一是 bug。**三次都错了**：
-
-| 轮次 | 我的结论 | 错在哪 |
+| 能力 | 本项目 | Redis |
 |---|---|---|
-| 1 | "关掉路径 A 更快 → 路径 A 没用" | 我的 A/B 副本把 `else` 写成"只查旧表"，测试本身错了 |
-| 2 | "叠加版更快 → Redis 的 if/else 是 bug" | 叠加快是因为**总工作量更大**，不是效率更高 |
-| 3 | "用 rehashidx 判断查哪张表会漏查 8.6%" | 规则漏写"跳过旧表后仍要查新表"，测的是我自己的 bug |
+| 网络模型 | 单线程 epoll | 单线程 epoll + 多 IO 线程 |
+| 认证 | ❌ 无 | ACL / requirepass |
+| 内存上限 | ❌ 无 | maxmemory + 淘汰策略 |
+| 持久化 | ❌ 无 | RDB / AOF |
+| 数据库分库 | ❌ 单库 | 16 个 db |
+| 单次命令数限流 | ❌ 无 | 有 |
+| 客户端空闲超时 | ✅ 有（轮询，需 `CLIENT_TIMEOUT` 开启） | 有 |
+
+---
+
+## 8. 配套文档
+
+按知识点命名（`docs/` 目录）：
+
+| 文档 | 回答什么问题 |
+|---|---|
+| [轮询.md](docs/轮询.md) | 服务器怎么发现「某个客户端已经太久没说话了」？为什么用轮询而不是每连接一个定时器？ |
+| [epoll机制.md](docs/epoll机制.md) | 一个线程怎么同时等 10000 个连接？影子掩码为什么必须有？ |
+| [字典设计.md](docs/字典设计.md) | `dict` 为什么用 `void*` + `dictType`？渐进式 rehash 的路径 A/B 怎么分工？ |
+| [跳表设计.md](docs/跳表设计.md) | 有序数据既要按分数排序、又要按成员名 O(1) 查到，一个结构怎么同时做到？ |
+| [数据结构选型.md](docs/数据结构选型.md) | 面对一个操作，怎么决定用哪种数据结构？ |
+| [字节流处理.md](docs/字节流处理.md) | 固定缓冲 vs SDS + 游标：粘包与半包怎么解决？ |
+
+---
+
+## 9. 开发日志
+
+### 阶段 1-4：从阻塞到 epoll 事件循环
+
+| 阶段 | 内容 | 关键产出 |
+|---|---|---|
+| **1** | `ae.h` / `ae.c` / `ae_epoll.c` 事件循环骨架 | 空跑验证 ae 层正确性 |
+| **2** | 接入事件循环，新建 `networking.c` | 可同时服务多连接（阶段 0 做不到） |
+| **3** | 输出缓冲 `outbuf` + 非阻塞发送 | 慢客户端不再拖累他人 |
+| **4** | 时间事件（定时器）+ `serverCron` 轮询式空闲超时 | `epoll_wait` 不再无限睡眠 |
+
+**阶段 3 的核心变化**：
+
+| | 改造前 | 改造后 |
+|---|---|---|
+| `send_response` | `while` 循环 `write`，阻塞到发完 | `sdscatlen` 进 `outbuf`，立即返回 |
+| 「还没发出去」的状态 | 由**内核**发送缓冲区暗中承担 | 由**我们自己的** `outbuf` 显式持有 |
+| 一条 `+OK` 的系统调用 | 3 次 `write` | 1 次 `write` |
+| 对端读得慢时 | 整个服务器停摆 | 只影响该连接 |
+
+**阶段 4 的两个设计决定**：
+
+- 定时器用**无序双向链表 + O(n) 扫描**（同 Redis）——
+  前提是**定时器数量不随连接数增长**，本项目只有 `serverCron` 一个。
+- 客户端空闲超时用**轮询**而不是「每连接一个定时器」——
+  后者在 10000 连接时会产生 10000 个定时器节点，
+  而 `aeSearchNearestTimer` / `processTimeEvents` **每轮都要跑**。
+
+### 阶段 5：解耦（`server.c` 一分为四）
+
+原 `server.c` 526 行里挤了三种「变化原因完全不同」的职责：
+
+| 文件 | 职责 | 变化原因 |
+|---|---|---|
+| `parser.c` | 三层解析器 | 协议规则变了 |
+| `reply.c` | 响应编码 | RESP 输出格式变了 |
+| `networking.c` | 网络驱动 | 网络模型变了 |
+| `server.c` | socket + 连接生命周期 | fd 资源管理 |
+
+同时斩断的隐式依赖：
+
+- `freeClient(c)` → `freeClient(el, c)`：撤关注要的 `el`，所有调用点手头就有
+- `writeToClientRaw` / `beforeSleep` 不再读 `g_server.el`
+- **删除 `Server.el` 字段** —— 改完后它变成「只写不读」的死状态
+- `BACKLOG` / `set_nonblocking` 三份定义 → `include/util.h` 一份
+
+### 阶段 6：渐进式 rehash
+
+先写 `bench/bench_rehash.c` **量化出瓶颈**：一次性搬迁在 100 万键时造成 **23.87 ms** 停顿，
+且随 N 线性增长（10 万 3.71 ms / 200 万 57.99 ms）—— 证明问题真实存在，不是背结论。
+
+实现渐进式 rehash 后：最大停顿从 **58 ms → 亚毫秒**（约 78×~120×），
+且不再随 N 量级跃升 —— 这正是 O(n)→O(1) 的签名。
+
+### ★ 三个值得记的教训
+
+#### 教训一：测量工具不能成为瓶颈
+
+写生产测试时，用 Python 多线程压测得到一条荒谬的曲线：
+**并发 2 比并发 4 还快**。
+
+查证后发现：Python 的 GIL 让多线程实际串行执行，
+并发 ≥4 时**客户端自己**成了瓶颈。
+改用 C 多进程客户端后曲线正常（1→2→4 递增，4 连接后饱和）。
+
+> **当测量结果违背常识时，先怀疑测量本身。**
+
+#### 教训二：拿局部性能数字否定还没理解的设计
+
+调渐进式 rehash 时，我一度认为「路径 A 和路径 B 应该叠加执行」，
+并写进文档说二选一是 bug。**连续三次都错了**：
+
+| 轮次 | 结论 | 错在哪 |
+|---|---|---|
+| 1 | 「关掉路径 A 更快 → 路径 A 没用」 | 我的 A/B 副本把 `else` 写成「只查旧表」，测试本身错了 |
+| 2 | 「叠加版更快 → Redis 的 `if/else` 是 bug」 | 叠加快是因为**总工作量更大**，不是效率更高 |
+| 3 | 「用 `rehashidx` 判断查哪张表会漏查 8.6%」 | 规则漏写「跳过旧表后仍要查新表」，测的是我自己的 bug |
 
 **真相**：Redis `unstable` 的 `_dictRehashStepIfNeeded` **就是 `if/else` 互斥的**，
-我最初的 `if (...) { 搬; return; }` 与它**语义完全等价**。是我的"修复"偏离了上游。
+我最初的写法与它**语义完全等价**。是我的「修复」偏离了上游。
 
-**共同错因：拿一个局部的性能数字，去否定一个我还没理解的设计。**
-转折点是去读 Redis 的真实源码 —— **当测量结果与上游成熟实现冲突时，先假设自己错了。**
+> **共同错因：拿一个局部的性能数字，去否定一个我还没理解的设计。**
+> **当测量结果与上游成熟实现冲突时，先假设自己错了。**
 
-**为什么二选一是对的**：一次操作最多搬一个桶 → 单次操作的**最坏延迟上限**最小。
-叠加版（一次最多搬两个桶）rehash 收敛更快（旧表残余 11,692 vs 55,952）、**QPS 更高**，
-但最坏延迟上限翻倍。服务端更在意后者。**这是取舍，不是对错。**
+#### 教训三：分批游标不能持有对象地址
 
-**本轮最终实现**
+`serverCron` 的分批扫描最初用 `static Client *cursor` 记住「上次扫到哪个节点」。
+那个节点可能在下一次 `serverCron` 之前被 `freeClient` 释放 → 游标成野指针。
 
-- `dictRehashStepIfNeeded` 改为 **if/else 二选一**（对齐 Redis，单次最多搬一桶）
-- `dictFindEntry` 用 **`rehashidx` 判断该查哪张表**（用户提出的优化）：
-  - `idx < rehashidx` → 旧桶已搬空 → **跳过旧表**（省掉 81% 的旧表访问）
-  - `idx >= rehashidx` → 先查旧表（命中率 84.4%），再查新表兜底
-  - ⚠ 关键陷阱：`idx < rehashidx` 时**仍必须查新表** —— rehash 期间新插入的 key 只在新表
-- 新增白盒对拍测试 `tests/test_lookup_order.c`（6/6 单测）：`idx < rehashidx` 位置 8.2 亿次检查、
-  旧表非空 0 次；30 万 key 全量对拍不一致 0；rehash 中增删查失败 0
-- **性能诚实报告**：idx 判定版 44.0 ns/op vs 两张表版 45.6 ns/op = **−3.5%，在噪声内**。
-  原因：被省掉的旧表访问 **81.3% 落在空槽**，而空槽访问本来就几乎不花钱。
-  **保留它的理由是结构清晰 + 与上游对齐，不是性能。**
+ASan 抓到的现场：
 
-**三个技术坑**
+```
+ERROR: AddressSanitizer: heap-use-after-free
+    #0 serverCron          src/networking.c:486
+    #1 processTimeEvents   src/ae.c:339
+  freed by: freeClient
+```
 
-- **坑 A（堆越界）**：路径 A 要用 `hash % old_capacity` 定位旧桶 —— 最初误用"新表下标"，而两表桶数不同（新 = 旧×2），导致 `buckets_old` **越界读写**
-- **坑 B（完成判定）**：不能只看 `rehashidx`（路径 A 会插队搬走它后面的桶）→ 改为维护 `old_used` 计数（Redis 的 `ht_used[0]`）
-- **坑 C（残余尖刺）**：经探针逐次定位，最大停顿发生在 `free(旧表)` 那一次（8MB 表 ≈ 0.39ms），是内核页表释放成本，**渐进式消不掉**
-- **固有债务**：插入结束时旧表仍有残余（30 万 key 剩 5.6 万），期间读路径要处理两张表。这是"把长停顿换成持续小开销"的必然代价
+**修复**：改用**时间分片** —— 只检查「空闲时长落在本片区间」的客户端，
+轮转状态是一个整数（`cronloops % slices`），不持有任何对象地址。
 
-**阶段 5：哈希表泛型化 + 跳表消重**
+> **教训：分批游标要存「可重算的标量」（下标/时间），不要存「对象地址」。**
+> 地址的生命周期不受你控制。
 
-- **`hashtable` → `dict`**：key/value 从 `sds` 放宽为 `void*`，引入 `dictType` 函数指针表（C 版 vtable），把「算哈希 / 比较 / 拷贝 / **销毁**」四件事外包给调用方。设计推导见 `docs/dict-design.md`
-- **跳表索引改用 `dict`**：删掉跳表内私有的 `IndexNode` / `buckets` / `index_*`（约 100 行重复实现），换成一份 `skipIndexDictType`（destructor 传空操作 = 借用语义）。两个调用方（storage 拥有 / 跳表索引借用）共用同一份 `dict` 核心代码
-- **补齐健壮性**：`dictFind` / `dictDelete` 补判空（原 `hashtable_get`/`del` 传 NULL 会段错误）；`dictEntry` 缓存 `hash` 值，扩容不再重算
-- 单测 `test_hashtable` → `test_dict`，并**新增通用性测试**：用一张「整数 key + 自定义 struct 指针 value + 空操作 destructor」的 `dictType`，验证同一份 `dict` 代码能处理非 sds 类型与借用语义
-- 跳表算法层复测：find 仍 O(1)（40 万成员 261ns），range/get_rank 仍 O(log n)
-- 集成 **51/51**、单元 **5/5**、ASan/UBSan/LSan 零泄漏
+---
 
-**阶段 4：SDS 接入与二进制安全**
+## 10. 开发工具
 
-- 全链路改用 SDS：协议解析、缓冲管理、哈希表、跳表、发送层
-- 修复 TYPE_5 有符号 char 位移导致的 16–31 字节崩溃（`(unsigned char)` 强转）
-- 修复 `send_null_bulk` 多发送的 1 字节 `\0`（`"$-1\r\n"` 长度应为 5）
-- send 层改为分段直发，去掉全部不定长固定数组与临时 sds
-- 拷贝边界对齐：zset_add 走 steal（member 所有权直接移交跳表，不 sdsdup）、ZADD 分支置 argv[3] 为 NULL；zset_range 深拷贝出可拥有副本
-- 全量测试 **35 → 40 用例**，全部通过
-- 压测对比 SDS vs 无 SDS，结论写入本文档
-- 新增延迟分布压测 `bench/bench_latency.py`：多档位大值（8B~128KB）的 SET/GET min/avg/p50/p99 延迟。结论：小命令（≤512B）无 SDS 延迟低约 10%–30%；**≥1KB 起无 SDS 因固定 1024 缓冲溢出崩溃，仅 SDS 能稳定服务**（详阅「压测数据 §4 延迟分档」）
-- 新增大数据吞吐压测 `bench/bench_throughput.py`：多档位大值（512B~128KB）的流水线 QPS + 载荷 MB/s。结论：512B 时无 SDS 载荷吞吐约为 SDS 2 倍；**≥1KB 无 SDS 崩溃，SDS 写吞吐 39→1674 MB/s 持续扩容**（详阅「压测数据 §3 大数据吞吐」）
-- 重构压测章节为「四把尺子」（正确性 / 吞吐 / 大数据吞吐 / 延迟），并新增「使用场景决策」：**纯文本小 KV 极致压 QPS 用无 SDS；含 `\0` 二进制、值 ≥1KB、或要生产级健壮性一律用 SDS**
-- 新增综合压测 `bench/bench_extreme.py`（极限吞吐 + 串行延迟 + 跳表 zset，支持 3 版二进制对比）与交错 A/B `bench/bench_ab.py`（轮换取中位数、抗机器漂移）。实测：**无 SDS 小命令吞吐 ~2.5-3x（SET 159k / GET 179k vs SDS ~57k）**；延迟三版都在 ~100-130µs 量级
-- 跳表区别（详阅「压测数据 §9 跳表」）：发现 `skiplist_find` 是 **O(n) 线性扫**，ZADD 每次先 O(n) 查重再插，故 ZADD 吞吐（SDS ~16k）明显低于 ZSCORE（~59k）、更低于哈希 GET。升级方向：改成真 O(log n) 多层跳查 —— **已在后续改造中落地**（`span` + member→node 哈希索引，find 变 O(1)、range/get_rank 变 O(log n)）
-- 「argv 不释放给哈希」优化：**steal 所有权改为默认行为**（`storage_set_steal`，不再用 `-DSTEAL_ARGV` 开关）；`Command{argc, argv}` 薄包装保留（`handle_command` 收 `(fd, Command*)`）。交错 A/B 实测 **8B 小值 +1.8%（噪声内）；32KB/128KB 大值 +7%**，40/40 测试过、无泄漏。薄包装收益≈0 纯为接口整洁，steal 无副作用所以默认开启（详阅「压测数据 §10 argv 不释放」）
-
-**阶段 3：有序集合（6.13 - 6.25）**
-
-- 排序链表暴力实现，感受 O(n) 插入
-- 搭建跳表，实现插入/查找/删除/范围查询
-- 集成服务器，支持 ZADD/ZRANGE/ZREM/ZSCORE
-
-**阶段 2：提速与重构（6.1 - 6.7）**
-
-- 实现 djb2 哈希表，替换动态数组，性能提升 > 10,000 倍
-
-**阶段 1：启动与存储（5.28 - 5.31）**
-
-- 从零搭建 TCP echo 服务器
-- 实现 RESP 协议解析
-- 动态数组存储引擎上线
-
-## 🛠️ 开发工具
-
-- 编译器：gcc
-- 构建工具：make
-- 内存检查：valgrind
-- 压测工具：redis-benchmark、自研 Python socket 压测脚本
-- 版本控制：Git + GitHub
-
-## 📄 许可证
-
-MIT License
+| 工具 | 用途 |
+|---|---|
+| gcc | 编译（`-Wall -Wextra -O2 -g`） |
+| make | 构建 |
+| ASan / UBSan / LSan | 内存与未定义行为检测（`make asan`） |
+| `bench/loadgen.c` | C 多进程压测客户端 |
+| Python 脚本 | 协议级测试与延迟测量 |
+| Git | 版本控制 |
