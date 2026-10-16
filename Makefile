@@ -84,6 +84,14 @@ tests/test_lookup_order: tests/test_lookup_order.o src/sds.o
 # 渐进式 rehash 微基准：量化"一次扩容造成的最大停顿"
 # 核心验证：最大停顿是否随 N 线性增长（线性=一次性搬迁；不变=渐进式）
 #   make benchrehash RUN=1000000
+# 目标：syscall —— 系统调用基线（不经过 mini-redis）
+#   用于判断「一次 write 到底该花多少 ns」是环境特性还是代码问题。
+#   make syscall           # 每项 20 万次
+#   make syscall RUN=1000000
+syscall: bench/bench_syscall.c
+	$(CC) $(CFLAGS) -o /tmp/bench_syscall bench/bench_syscall.c
+	/tmp/bench_syscall $(RUN)
+
 benchrehash: bench/bench_rehash.c $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o /tmp/bench_rehash bench/bench_rehash.c src/dict.c src/sds.c
 	/tmp/bench_rehash $(RUN)
@@ -91,6 +99,26 @@ benchrehash: bench/bench_rehash.c $(COMMON_OBJS)
 benskip: bench/bench_skipspan.c $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o /tmp/bench_skipspan bench/bench_skipspan.c src/skiplist.c src/dict.c src/sds.c
 	/tmp/bench_skipspan $(RUN) $(REPS)
+
+# ------------------------------------------------------------
+# 生产环境模拟测试（正确性 / 健壮性 / 性能 / A/B 对比）
+#   make abtest        准备 A/B 两个可执行文件（A 从 git 历史导出）
+#   make prodtest      跑全部四组（约 10 分钟）
+#   make prodtestquick 缩短规模冒烟（约 2 分钟）
+# ★ loadgen 是 C 多进程压测客户端 —— 用它而不是 Python 多线程，
+#   是因为 Python 的 GIL 会让并发 >= 4 时【客户端自己】成为瓶颈。
+ABSETUP = bench/setup_ab.sh
+loadgen: bench/loadgen.c
+	$(CC) -O2 -Wall -Wextra -o /tmp/loadgen bench/loadgen.c
+
+abtest: loadgen
+	./$(ABSETUP)
+
+prodtest: loadgen
+	python3 bench/prod_test.py
+
+prodtestquick: loadgen
+	python3 bench/prod_test.py --quick
 
 # ------------------------------------------------------------
 # 自动化集成测试：先编译，再运行 test.sh
@@ -139,7 +167,7 @@ distclean: clean
 	rm -f final_bench.csv bench/*.csv
 
 # 伪目标声明（避免目录下恰好有同名文件导致冲突）
-.PHONY: all test unit check asan valgrind benskip benchrehash clean distclean test_lookup_order
+.PHONY: all test unit check asan valgrind benskip benchrehash syscall clean distclean test_lookup_order loadgen abtest prodtest prodtestquick
 
 # 引入自动生成的依赖；文件不存在时静默忽略（首次编译）
 -include $(DEPS)
