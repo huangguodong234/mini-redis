@@ -142,6 +142,7 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
      * 否则会提前醒来空转一轮。tvp == NULL 表示无限等待（-1）。 */
     int timeout = tvp ? (int)(tvp->tv_sec * 1000 + (tvp->tv_usec + 999) / 1000) : -1;
 
+    //最多睡timeout时间，但是有数据来可以马上醒来，不用等到timeout时。
     int retval = epoll_wait(state->epfd, state->events, eventLoop->setsize, timeout);
     if (retval > 0) {
         numevents = retval;

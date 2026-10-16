@@ -5,7 +5,9 @@
  * ae.h —— 事件循环（移植/精简自 Redis 的 ae 层，unstable 分支）
  * ============================================================
  *
- * ★ 设计要点（与 Redis 一致，详细推导见 docs/ae-design.md 待补）：
+ * ★ 设计要点（与 Redis 一致）。配套文档：
+ *   · epoll 后端原理、一个线程怎么等很多连接 → docs/epoll机制.md
+ *   · 定时器、空闲超时为什么用轮询       → docs/轮询.md
  *
  *   1. 把「操作系统怎么等事件」彻底隔离出去。ae.c 只调用
  *      aeApiCreate/AddEvent/DelEvent/Poll/... 这几个名字，具体实现由
@@ -60,7 +62,7 @@ typedef void aeFileProc(aeEventLoop *eventLoop, int fd, void *clientData, int ma
 typedef void aeBeforeSleepProc(aeEventLoop *eventLoop);
 
 /* ============================================================
- * 定时器（时间事件 / 时间事件）
+ * 定时器（时间事件 ）
  * ============================================================
  * ★ 与文件事件的根本不同：
  *     文件事件 = 内核告诉我们「什么时候发生了什么」
