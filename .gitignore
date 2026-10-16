@@ -34,3 +34,7 @@ __pycache__/
 # 环境痕迹
 .git-cloned-via.txt
 .vscode/
+
+# 本地评审/笔记（只给自己看，不入库）
+REVIEW*.md
+.workbuddy/
