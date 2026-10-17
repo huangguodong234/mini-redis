@@ -570,6 +570,139 @@ PYEOF
 }
 assert_eq "定时器分批扫描：频繁断开不导致悬垂游标（阶段4 UAF 回归）" "OK" "$(py_cron_uaf_probe)"
 
+# 8.3c 拒绝路径不能误伤正常连接（混合负载测试回归）：
+#       maxclients 超限时，旧实现直接 close()，客户端只收到 RST，
+#       日志是 "Connection reset by peer" —— 分不清是服务器满了、
+#       网络故障、还是自己协议写错。现在改为先回 -ERR 再关
+#       （rejectWithError）。这里确认加了这条逻辑后正常连接不受影响。
+py_maxclients_probe() {
+    python3 - <<'PYEOF'
+import os, socket, subprocess, time
+host = os.environ.get('HOST', '127.0.0.1')
+port = int(os.environ.get('MC_PORT', '6398'))
+srv = subprocess.Popen(['./mini-redis', str(port)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    for _ in range(50):
+        try:
+            t = socket.create_connection((host, port), 0.2); t.close(); break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        print("SERVER_NOT_UP"); raise SystemExit
+    s = socket.create_connection((host, port), 3)
+    s.settimeout(3)
+    s.sendall(b"*1\r\n$4\r\nPING\r\n")
+    ok = (s.recv(64) == b"+PONG\r\n")
+    s.close()
+    print("OK" if ok else "PING_FAIL")
+finally:
+    srv.terminate()
+    try: srv.wait(timeout=5)
+    except subprocess.TimeoutExpired: srv.kill()
+PYEOF
+}
+assert_eq "拒绝路径不误伤正常连接（maxclients 回归）" "OK" "$(py_maxclients_probe)"
+
+# 8.3d 请求缓冲超限必须回错误再断（混合负载测试回归）：
+#       旧实现只打一行服务端日志就 close，客户端只看到连接莫名断掉，
+#       不知道是自己发了一条「声明长度巨大却永远发不完」的命令。
+py_querybuf_probe() {
+    python3 - <<'PYEOF'
+import os, socket, subprocess, time
+host = os.environ.get('HOST', '127.0.0.1')
+port = int(os.environ.get('QB_PORT', '6397'))
+srv = subprocess.Popen(['./mini-redis', str(port)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    for _ in range(50):
+        try:
+            t = socket.create_connection((host, port), 0.2); t.close(); break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        print("SERVER_NOT_UP"); raise SystemExit
+    s = socket.create_connection((host, port), 3)
+    s.settimeout(10)
+    s.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$536870912\r\n")
+    blob = b"x" * (1024 * 1024)
+    try:
+        for _ in range(80):
+            s.sendall(blob)
+    except OSError:
+        pass
+    s.settimeout(5)
+    reply = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            reply += d
+    except OSError:
+        pass
+    s.close()
+    print("OK" if b"query buffer limit reached" in reply else
+          "NO_ERROR_REPLY:%r" % reply[:80])
+finally:
+    srv.terminate()
+    try: srv.wait(timeout=5)
+    except subprocess.TimeoutExpired: srv.kill()
+PYEOF
+}
+assert_eq "请求缓冲超限回错误再断（回归）" "OK" "$(py_querybuf_probe)"
+
+# 8.3e fd 耗尽必须回错误（混合负载测试回归）：
+#       accept() 因 EMFILE 失败时内核【不返回 fd】，所以连"回一条错误"
+#       都做不到 —— 客户端只能干等到超时。修复是启动时预留 1 个应急 fd，
+#       真到 EMFILE 就关掉它腾出名额、accept、回 -ERR、再重新占位。
+#       ★ 用 ulimit -n 把服务器的 fd 配额压到很小来复现，
+#         这也是唯二能真实触发 EMFILE 的办法（另一条是灌满系统 fd）。
+py_emfile_probe() {
+    bash <<'BASHEOF'
+ulimit -n 40
+PORT=${EMFILE_PORT:-6396}
+./mini-redis "$PORT" >/tmp/emfile-srv.log 2>&1 &
+SRV=$!
+trap 'kill -9 $SRV 2>/dev/null' EXIT
+python3 - "$PORT" <<'PYEOF'
+import socket, sys, time
+port = int(sys.argv[1])
+for _ in range(50):
+    try:
+        t = socket.create_connection(('127.0.0.1', port), 0.2); t.close(); break
+    except OSError:
+        time.sleep(0.1)
+else:
+    print("SERVER_NOT_UP"); raise SystemExit
+
+# 保持连接不关，把服务器的 fd 配额耗光
+held = []
+rejected = 0
+for i in range(80):
+    try:
+        s = socket.create_connection(('127.0.0.1', port), 1)
+        s.settimeout(1.0)
+        s.sendall(b"*1\r\n$4\r\nPING\r\n")
+        d = s.recv(200)
+        if d.startswith(b"-ERR"):
+            rejected += 1
+            s.close()
+            if rejected >= 1:
+                break
+            continue
+        held.append(s)
+    except OSError:
+        break
+for c in held:
+    try: c.close()
+    except OSError: pass
+print("OK" if rejected > 0 else "NO_ERR_REPLY(held=%d)" % len(held))
+PYEOF
+BASHEOF
+}
+assert_eq "fd 耗尽回错误而不是静默丢弃（EMFILE 回归）" "OK" "$(py_emfile_probe)"
+
 # 8.4 优雅退出回归（P0-2）：有客户端连接着时发 SIGINT，服务器必须能退出。
 #     修复前：readQueryFromClient 的 EINTR 分支无条件 continue，
 #             只要还有客户端连着，Ctrl+C 就永远退不出去（只能等客户端断开）。

@@ -98,6 +98,12 @@ int main(int argc, char **argv){
     /*创建服务器 socket（已绑定并监听）*/
     int server_fd = create_server_socket(port, BACKLOG);
 
+    /* ★ 预留应急 fd（必须在开始 accept 之前）。
+     *   它占掉 1 个 fd 名额，换来的是：真到 EMFILE 时还能 accept 一个连接、
+     *   回一条 "-ERR out of file descriptors"，而不是让客户端干等超时。
+     *   详见 networking.c 的 acceptAndRejectWhenExhausted。 */
+    reserveCrisisFd();
+
     /* ★ listen fd 也要非阻塞 —— 否则 accept 可能卡住事件循环。
      *   （accept 返回 EAGAIN 表示当前没有新连接，正常退出循环即可） */
     if (set_nonblocking(server_fd) == -1) {

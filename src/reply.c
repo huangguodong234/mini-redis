@@ -42,6 +42,29 @@
 void send_response(Client *c, const void *data, size_t len){
     if (!c || !data || len == 0) return;
 
+    /* ★ 输出缓冲上限检查（续命检查，fail-fast）：
+     *   对端不读回复时，write() 会一直 EAGAIN，outbuf 只增不减。
+     *   没有上限的话，一条连接就能把进程撑到 OOM（实测 3 条连接
+     *   让 RSS 从 1MB 涨到 5.3GB 并继续涨）。
+     *   ★ 这里只做「标记」，不在这里断开连接 —— 因为 send_response
+     *     是在命令执行途中被调用的，此刻 freeClient 会让命令层手里
+     *     的 Client* 立刻变成悬垂指针。
+     *     正确做法：打标记，由事件循环在【回调返回之后】统一踢掉
+     *     （见 beforeSleep 里的处理），那才是安全点。 */
+    if (sdslen(c->outbuf) - c->outbuf_pos + len > MAX_OUTBUF) {
+        if (!c->output_over_limit) {
+            c->output_over_limit = 1;
+            fprintf(stderr,
+                    "[fd=%d] 输出缓冲超限（未发 %zu + 新增 %zu > %d），将在本轮末断开"
+                    "（对端不读回复）\n",
+                    c->fd, sdslen(c->outbuf) - c->outbuf_pos, len, MAX_OUTBUF);
+            /* 尽量让客户端知道原因；即使发不出去也不影响断开流程 */
+            send_response(c, "-ERR output buffer limit reached, closing\r\n",
+                          sizeof("-ERR output buffer limit reached, closing\r\n") - 1);
+        }
+        return;   /* ★ 不再追加，防止内存继续膨胀 */
+    }
+
     /* sds 是二进制安全的（带长度），所以数据里的 '\0' 不会截断 */
     sds nb = sdscatlen(c->outbuf, data, len);
     if (!nb) {
@@ -54,6 +77,10 @@ void send_response(Client *c, const void *data, size_t len){
         return;
     }
     c->outbuf = nb;
+    /* ★ 标记"有新数据"，让 beforeSleep 知道该尝试写一次。
+     *   没有这个标记时，beforeSleep 只能每轮都试 → 对端不读时
+     *   EAGAIN 紧循环把 CPU 打满（实测 86%），并拖慢其它连接。 */
+    c->reply_pending = 1;
 }
 
 // ==================== RESP 编码 / 发送辅助函数 ====================

@@ -54,6 +54,9 @@ Client *create_client(int fd){
 
     c->fd=fd;
     c->qb_pos=0;
+    c->output_over_limit=0;   // 输出缓冲超限标记（reply.c 置位）
+    c->outbuf_pos=0;          // 输出缓冲的发写游标
+    c->reply_pending=0;       // 本轮是否有新数据待发
     c->querybuf = sdsempty();   // 用 sds 动态缓冲区，自动扩容，无固定大小限制
     if (!c->querybuf) {         // OOM：释放并返回 NULL
         free(c);

@@ -86,18 +86,42 @@ int main(int argc, char **argv) {
     int nproc    = atoi(argv[2]);
     int depth    = atoi(argv[3]);
     double dur   = atof(argv[4]);
+    long vlen    = (argc > 5) ? atol(argv[5]) : 0;   /* >0: 用 SET 代替 PING */
 
     if (port <= 0 || nproc <= 0 || depth <= 0 || dur <= 0) {
         fprintf(stderr, "参数必须为正数\n");
         return 2;
     }
 
-    /* 预先拼好一批命令，循环发送时不用重复构造 */
-    char *batch = malloc((size_t)PING_LEN * (size_t)depth);
+    /* 预先拼好一批命令，循环发送时不用重复构造。
+     * vlen > 0 时改用 SET benchval <vlen 字节>（回 +OK\r\n 5 字节），
+     * 用来测「命令变重后饱和点怎么变」。 */
+    size_t cmd_len;
+    char *cmd = NULL;
+    if (vlen > 0) {
+        const char *key = "benchval";
+        char hdr[256];
+        int hn = snprintf(hdr, sizeof(hdr),
+                          "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%ld\r\n",
+                          strlen(key), key, vlen);
+        cmd_len = (size_t)hn + (size_t)vlen + 2;
+        cmd = malloc(cmd_len);
+        if (!cmd) return 1;
+        memcpy(cmd, hdr, (size_t)hn);
+        memset(cmd + hn, 'V', (size_t)vlen);
+        cmd[hn + vlen] = '\r';
+        cmd[hn + vlen + 1] = '\n';
+    } else {
+        cmd_len = PING_LEN;
+        cmd = malloc(cmd_len);
+        if (!cmd) return 1;
+        memcpy(cmd, PING_CMD, PING_LEN);
+    }
+    char *batch = malloc(cmd_len * (size_t)depth);
     if (!batch) return 1;
     for (int i = 0; i < depth; i++)
-        memcpy(batch + (size_t)i * PING_LEN, PING_CMD, PING_LEN);
-    const size_t batch_bytes = (size_t)PING_LEN * (size_t)depth;
+        memcpy(batch + (size_t)i * cmd_len, cmd, cmd_len);
+    const size_t batch_bytes = cmd_len * (size_t)depth;
 
     int (*pipes)[2] = malloc(sizeof(int[2]) * (size_t)nproc);
     if (!pipes) { free(batch); return 1; }

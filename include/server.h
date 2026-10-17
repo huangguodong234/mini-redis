@@ -19,6 +19,25 @@ extern volatile sig_atomic_t Keep_running;
  *   Redis 默认 10000，本项目取同样量级。 */
 #define MAX_CLIENTS 10000
 
+/* 单个客户端允许积压的【输出】缓冲上限（对应 Redis 的
+ * client-output-buffer-limit normal 的硬限制）。
+ *
+ * ★ 为什么必须有它 —— 这是混合负载测试挖出来的真实漏洞（不是理论风险）：
+ *   一个连上来、拼命发命令但【从不读回复】的客户端（下游卡死、
+ *   被防火墙挡住、故意搞破坏），会让服务器把回复不断堆进 c->outbuf。
+ *   而 write() 永远返回 EAGAIN（对端收窗口是满的），所以 outbuf
+ *   只增不减。实测 3 条这样的连接，RSS 从 1MB 涨到 5.3GB 且还在涨，
+ *   直接把整台机器拖进 OOM —— 一条连接就能打死整个进程。
+ *
+ * ★ 为什么在【入队】处拦，而不是在写失败处拦：
+ *   写失败只能看到一次次 EAGAIN，无法判断"已经堆了多少"；
+ *   而在 send_response 里，size 是精确的，超限就能立刻判定并断开。
+ *
+ * ★ 阈值取 64MB：正常客户端读得比写得快，outbuf 通常只有几百字节~
+ *   几 KB（一条 1MB 的 GET 回复也就 1MB）。真到 64MB，说明对端
+ *   已经停止读取了 —— 此时断开是唯一正确的处理（Redis 也是这么做的）。 */
+#define MAX_OUTBUF (64 * 1024 * 1024)
+
 /* ============================================================
  * Client —— 每个连接的状态
  * ============================================================
@@ -36,6 +55,11 @@ extern volatile sig_atomic_t Keep_running;
  *   ★ 两个容器存同一批对象，各服务一类操作（同 Redis 的 clients 链表）。 */
 typedef struct Client {
     int fd;
+    /* ★ 输出缓冲已超限（由 reply.c 置位，由 beforeSleep 统一断开）。
+     *   为什么用标记而不是当场断开：send_response 在命令执行途中被调用，
+     *   此刻 freeClient 会让调用栈上手里的 Client* 立刻悬垂。
+     *   「打标记 + 延迟处理」是事件循环里处理"回调中途发现要关闭"的通用手法。 */
+    int output_over_limit;
     sds querybuf;             // 请求缓冲区（SDS 动态扩容，不再有固定大小限制）
     size_t qb_pos;            // 解析游标：已解析数据的进度（相对 querybuf 起点）
                               // 缓冲区有效长度用 sdslen(querybuf) 取，O(1)
@@ -49,6 +73,15 @@ typedef struct Client {
      *   改成非阻塞后，主动权回到事件循环，这个状态就必须由我们自己显式持有，
      *   载体就是它。 */
     sds outbuf;
+    /* ★ outbuf 里【已发送】的字节数（写游标）。
+     *   为什么不每写一次就 sdsrange 把剩下的挪到开头：那样每次都要
+     *   memmove 整个剩余缓冲，对端读得慢时（outbuf 几十 MB、每次只
+     *   写出几 KB）变成 O(n²) —— 实测单次 memmove 可达 6.4ms。
+     *   游标一直推进，只在【全部发完】时回收一次空间。 */
+    size_t outbuf_pos;
+    /* ★ 本轮是否有新数据待发送（send_response 置位，beforeSleep 消费）。
+     *   用来避免"对端不读时每轮都去 write 一次 EAGAIN"造成的 CPU 空转。 */
+    int reply_pending;
 
     // 状态机存档变量（对应 Redis processMultibulkBuffer 的状态）
     int cmd_start;
@@ -140,6 +173,15 @@ int serverCron(aeEventLoop *el, long long id, void *clientData);
 /* listen fd 可读回调：循环 accept 到 EAGAIN，为每个新连接建 Client 并注册可读。
  * 用法：aeCreateFileEvent(el, server_fd, AE_READABLE, acceptTcpHandler, NULL) */
 void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask);
+void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask);
+
+/* 启动时预留 1 个应急 fd（打开 /dev/null 占住），供 fd 耗尽时回 -ERR 使用。
+ * ★ 为什么必须预留：accept() 因 EMFILE 失败时内核【不返回 fd】，
+ *   没有 fd 就连一条错误消息都发不出去，客户端只能干等到超时。
+ *   预留一个名额后，真到 EMFILE 就关掉它腾出位置，accept 一个、
+ *   回 -ERR、再关、然后重新占位（Redis 同款手法）。
+ * 用法：在创建监听 socket 之后、进入事件循环之前调一次。 */
+void reserveCrisisFd(void);
 
 /* 客户端 fd 可读回调：★ 只读一次（非阻塞），追加到 querybuf 后交给解析层。
  * 对应 Redis 的 readQueryFromClient。 */

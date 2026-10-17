@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>     /* open()：预留应急 fd */
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -140,8 +141,10 @@ void freeClient(aeEventLoop *el, Client *c) {
      *   短暂阻塞不影响别的连接，而且通常一次就写完。
      *   ⚠ 但对端完全不读时不能无限等 —— 所以 EAGAIN 就放弃剩余数据
      *     （宁可丢掉尾部，也不能把整个服务器拖住）。 */
-    if (sdslen(c->outbuf) > 0) {
-        size_t sent = 0;
+    if (c->outbuf_pos < sdslen(c->outbuf)) {
+        /* ★ 从 outbuf_pos 开始发：前面 [0, outbuf_pos) 是【已经写出过】的，
+         *   重发会造成客户端收到重复字节（RESP 流错位）。 */
+        size_t sent = c->outbuf_pos;
         size_t total = sdslen(c->outbuf);
         while (sent < total) {
             ssize_t n = write(c->fd, c->outbuf + sent, total - sent);
@@ -173,6 +176,125 @@ void freeClient(aeEventLoop *el, Client *c) {
     free(c);
 }
 
+/* ------------------------------------------------------------
+ * 应急 fd —— fd 耗尽时还能回一条错误消息的唯一办法
+ * ------------------------------------------------------------
+ * ★ 问题：accept() 因 EMFILE 失败时，内核【没有返回 fd】。
+ *   没有 fd 就没法 write 任何东西 —— 客户端会被晾着，直到自己超时。
+ *   运维在服务端也只看到一行 "Too many open files"。
+ *
+ * ★ 解法（Redis 同款）：启动时预留 1 个 fd 一直占着不释放。
+ *   于是真实可用 fd 数比 RLIMIT 少 1；真到 EMFILE 时：
+ *     ① close(应急 fd)      → 立刻腾出 1 个名额
+ *     ② 再 accept 一次       → 这次能成功，拿到那个名额
+ *     ③ 回 -ERR 后 close     → 客户端知道原因了
+ *     ④ 重新 open 占住名额   → 为下一次 EMFILE 做准备
+ *
+ * ★ 为什么用 /dev/null 去占：
+ *   它是永远可用的 fd 来源；用 dup() 一个必须合法存在的 fd 也行，
+ *   但 /dev/null 的语义最没有歧义（不占磁盘、不占设备）。
+ */
+static int g_crisis_fd = -1;
+
+/* 前向声明：应急 fd 的处理要用到它，而它的定义在后面 */
+static size_t rejectWithError(int fd, const char *msg);
+
+/* 启动时调用一次：预留应急 fd。
+ * ★ 必须在创建事件循环【之前】调：要保证这个 fd 号码落在
+ *   ae 的 events[] 容量范围内？—— 不需要，它从不注册进事件循环，
+ *   只是一个被占用的名额。 */
+void reserveCrisisFd(void) {
+    g_crisis_fd = open("/dev/null", O_RDONLY);
+    if (g_crisis_fd == -1) {
+        /* 占不到位不影响正确性，只是 EMFILE 时无法告知客户端 */
+        fprintf(stderr, "[init] 无法预留应急 fd（%s），EMFILE 时将无法回 -ERR\n",
+                strerror(errno));
+        return;
+    }
+    printf("[init] 已预留应急 fd=%d（fd 耗尽时用它回 -ERR）\n", g_crisis_fd);
+}
+
+/* fd 耗尽时：腾名额 → accept 一个 → 回错误 → 关 → 重新占位 */
+static void acceptAndRejectWhenExhausted(int listen_fd, int saved_errno) {
+    if (g_crisis_fd == -1) {
+        /* 没有应急 fd：只能放弃，客户端会自己超时 */
+        return;
+    }
+
+    /* ① 腾出 1 个名额 */
+    close(g_crisis_fd);
+    g_crisis_fd = -1;
+
+    /* ② 现在这次 accept 应当能成功（拿到刚腾出的那个 fd 号） */
+    struct sockaddr_in caddr;
+    socklen_t clen = sizeof(caddr);
+    int cfd = accept(listen_fd, (struct sockaddr *)&caddr, &clen);
+    if (cfd >= 0) {
+        /* ③ 告知原因后关闭
+         *    ★ 消息里带上具体错误码：ENFILE 是「整台机器满了」，
+         *      EMFILE 是「本进程配额满了」，运维处置方式完全不同。 */
+        rejectWithError(cfd, saved_errno == ENFILE
+                             ? "out of file descriptors (system-wide, ENFILE)"
+                             : "out of file descriptors (EMFILE)");
+        close(cfd);
+    }
+
+    /* ④ 重新占住名额，为下一次 EMFILE 做准备
+     *    ★ 即使上面 accept 失败也要重新占 —— 否则下一次 EMFILE
+     *      就彻底没有应急手段了。 */
+    g_crisis_fd = open("/dev/null", O_RDONLY);
+}
+
+/* ------------------------------------------------------------
+ * rejectWithError —— 关闭一个 fd 之前，先尽力把错误消息发出去
+ * ------------------------------------------------------------
+ * ★ 为什么必须有它（而不是直接 close）：
+ *   直接 close() 时，若接收缓冲里还有客户端已发、我们没读的数据，
+ *   内核会发 RST 而不是 FIN —— 客户端看到的是 "Connection reset by
+ *   peer"，拿不到任何可读原因。运维于是分不清：
+ *     「服务器满了」还是「网络抖动」还是「我自己协议写错了」。
+ *   Redis 在 maxclients 超限时同样先发
+ *   "-ERR max number of clients reached" 再关，本项目对齐这个行为。
+ *
+ * ★ 调用约束：
+ *   · 只用于【尚未注册进事件循环】的 fd（accept 出来但还没 create_client）。
+ *     已经注册的 fd 必须走 send_response + freeClient，不能走这里。
+ *   · 先 shutdown(SHUT_WR) 再 close：让对端先收到 FIN，
+ *     能确定「这条消息是完整的」，避免 close 因未读数据触发 RST 把它冲掉。
+ *   · 发送是【尽力而为】：EAGAIN/EPIPE 立刻放弃，绝不在这里等待 ——
+ *     本函数在 accept 热路径上，一旦阻塞就会卡住整个事件循环。
+ *
+ * 返回实际写出的字节数（仅供日志，调用方不依赖）。
+ */
+static size_t rejectWithError(int fd, const char *msg) {
+    if (fd < 0 || !msg) return 0;
+
+    char buf[256];
+    const char *prefix = "-ERR ";
+    size_t plen = 5, mlen = strlen(msg);
+    size_t total = plen + mlen + 2;
+
+    if (total >= sizeof(buf)) {
+        /* 消息异常长：截断，绝不允许越界（这是内核路径上的栈缓冲） */
+        mlen = sizeof(buf) - plen - 3;
+        total = plen + mlen + 2;
+    }
+    memcpy(buf, prefix, plen);
+    memcpy(buf + plen, msg, mlen);
+    memcpy(buf + plen + mlen, "\r\n", 2);
+
+    size_t off = 0;
+    while (off < total) {
+        ssize_t n = write(fd, buf + off, total - off);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;                  /* EAGAIN / EPIPE：放弃，不重试 */
+    }
+    shutdown(fd, SHUT_WR);
+    return off;
+}
+
+
 /* ============================================================
  * acceptTcpHandler —— listen fd 可读
  * ============================================================
@@ -197,7 +319,35 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask) {
             /* ★ EAGAIN/EWOULDBLOCK = 队列空了 = 正常出口，不是错误 */
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;          /* 信号打断，重试 */
-            /* EMFILE/ENFILE 等：★ 必须 break（详见下方 EMFILE 说明） */
+
+            /* ---- fd 耗尽（EMFILE = 本进程到上限，ENFILE = 系统到上限）----
+             *
+             * ★ 这是「沉默故障」的经典现场，必须专门处理，光 break 不够：
+             *   accept 失败时内核【没有给你 fd】，所以连「回一条错误再关」
+             *   都做不到 —— 客户端只会被晾在那里，直到它自己超时。
+             *   运维这边只能看到 perror 打一行 "Too many open files"。
+             *
+             * ★ 解法（Redis 同款）：预留一个「应急 fd」。
+             *   正常情况下它一直占着不用，于是真实 fd 用量比 RLIMIT 少 1；
+             *   真到 EMFILE 时，把它 close 掉就立刻腾出 1 个 fd 名额，
+             *   用这个名额去 accept、回一条 -ERR、再关 ——
+             *   客户端至少知道「服务器资源耗尽」，而不是干等。
+             *   处理完立刻重新占住那个名额，为下一次做准备。
+             *
+             * ★ 为什么用 static 而不是放进 Server 结构：
+             *   它是纯粹的「fd 配额管理」，和业务状态无关；
+             *   而且只能由 accept 路径读写，放全局反而更容易看清它只有一份。 */
+            if (errno == EMFILE || errno == ENFILE) {
+                fprintf(stderr,
+                        "[listen] fd 耗尽（%s），用应急 fd 回 -ERR 后继续\n",
+                        errno == EMFILE ? "EMFILE" : "ENFILE");
+                acceptAndRejectWhenExhausted(fd, errno);
+                break;   /* 本轮不再 accept：腾出的名额已用掉 */
+            }
+
+            /* 其他 accept 错误（ECONNABORTED / EPROTO 等）：本次连接坏了，
+             * ★ 用 break 而不是 return —— accept 循环的约定是「一次
+             *   通知尽量拿完队列」。continue 会在这里空转（同一个错误重复出现）。 */
             perror("accept");
             break;
         }
@@ -215,12 +365,16 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask) {
          *        无法区分"队列里真有一个"还是"伪唤醒"，容易多算/漏算。
          *      · ★ accept 之后（本实现）：代价是 accept 一个再 close 掉，
          *        多一次系统调用。换来的是判断总是基于真实计数，绝不误判。
-         *      · 拒绝方式：直接 close 会让客户端收到 RST（或空回复），
-         *        更好的做法是先回一条 "-ERR max number of clients reached"
-         *        再关（Redis 就这么做）—— ★ 本项目【未实现】，属已知局限。
+         *      · 拒绝方式：★ 先回一条 "-ERR max number of clients reached"
+         *        再关（对齐 Redis 行为）。直接 close 会让客户端只收到
+         *        RST —— 运维看到的日志是 "Connection reset by peer"，
+         *        完全区分不出「服务器满了」「网络故障」「自己写错了」。
          *    Redis 在 acceptTcpHandler 里也是 accept 之后再查 maxclients。 */
         if (g_server.numclients >= MAX_CLIENTS) {
-            fprintf(stderr, "连接数已达上限 %d，拒绝 fd=%d\n", MAX_CLIENTS, cfd);
+            fprintf(stderr,
+                    "[fd=%d] 连接数已达上限 %d，回 -ERR 后关闭\n",
+                    cfd, MAX_CLIENTS);
+            rejectWithError(cfd, "max number of clients reached");
             close(cfd);
             continue;
         }
@@ -230,6 +384,10 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask) {
 
         Client *c = create_client(cfd);
         if (!c) {
+            /* ★ 分配 Client 失败 = 内存耗尽。以前直接 close，客户端只看到
+             *   连接被重置；现在先告诉它原因，运维也能从客户端侧看到。 */
+            fprintf(stderr, "[fd=%d] 创建 Client 失败（OOM），回 -ERR 后关闭\n", cfd);
+            rejectWithError(cfd, "out of memory");
             close(cfd);
             continue;
         }
@@ -239,7 +397,12 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *clientData, int mask) {
          *    回调时原样还给我们（readQueryFromClient 的第三个参数） */
         if (aeCreateFileEvent(el, cfd, AE_READABLE,
                               readQueryFromClient, c) == AE_ERR) {
-            fprintf(stderr, "注册 fd=%d 失败\n", cfd);
+            /* ★ 注册失败意味着这个连接永远不会被调度到 —— 不告诉客户端
+             *   就是「连上了但永远不回话」，对客户端而言是最难排查的形态。
+             *   这里先把消息写进 outbuf，再由 freeClient 的收尾 flush 发出。 */
+            fprintf(stderr, "[fd=%d] 注册事件失败（fd 超出事件数组容量？），回 -ERR 后关闭\n",
+                    cfd);
+            send_error(c, "ERR server cannot register event for this connection");
             freeClient(el, c);
             continue;
         }
@@ -277,9 +440,23 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask) {
          *     而它其实很活跃，只是内容不对 —— 那该由协议错误路径处理。） */
         c->lastinteraction = aeGetTimeMilliseconds();
 
-        /* 防御：请求缓冲不能无限增长（恶意客户端只发不解析） */
+        /* 防御：请求缓冲不能无限增长（恶意客户端只发不解析）。
+         *
+         * ★ 断开前要先告诉客户端「为什么」。
+         *   以前这里只打一行服务端日志就 close，客户端什么也收不到 ——
+         *   它只知道「连接莫名其妙断了」，不知道是自己发了一条声明长度
+         *   巨大却永远发不完的命令。排查成本差一个数量级。
+         *
+         * ★ 为什么走 send_error + freeClient，而不是 rejectWithError：
+         *   这个 fd 已经注册进事件循环了，错误消息必须先入 outbuf，
+         *   再由 freeClient 的收尾 flush 同步写出（那条路径已经存在）。
+         *   用 rejectWithError 直接 write 会绕过 outbuf，和已有的
+         *   「可能半截回复已入队」状态打架。 */
         if (sdslen(c->querybuf) + (size_t)n > MAX_QUERYBUF) {
-            fprintf(stderr, "[fd=%d] 请求缓冲超限，断开\n", fd);
+            fprintf(stderr,
+                    "[fd=%d] 请求缓冲超限（%zu + %zd > %d），回 -ERR 后断开\n",
+                    fd, sdslen(c->querybuf), n, MAX_QUERYBUF);
+            send_error(c, "ERR query buffer limit reached (client-query-buffer-limit)");
             freeClient(el, c);
             return;
         }
@@ -288,9 +465,13 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask) {
          * 但不释放旧 sds，直接赋给 c->querybuf 会因 NULL 覆盖而泄漏。 */
         sds nb = sdscatlen(c->querybuf, buf, (size_t)n);
         if (!nb) {
+            fprintf(stderr, "[fd=%d] 请求缓冲扩容失败（OOM），回 -ERR 后关闭\n", fd);
+            /* ★ 顺序很重要：先把错误写进 outbuf，再释放 querybuf。
+             *   send_error 只碰 outbuf，不碰 querybuf，所以这里安全；
+             *   而 freeClient 的收尾 flush 会把它同步发出去。 */
+            send_error(c, "ERR out of memory (query buffer grow failed)");
             sdsfree(c->querybuf);
             c->querybuf = NULL;
-            fprintf(stderr, "[fd=%d] 缓冲区扩容失败\n", fd);
             freeClient(el, c);
             return;
         }
@@ -303,6 +484,10 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask) {
          *   但回调签名里没有 —— 这才是全局变量存在的正当理由。 */
         int prc = processInputBuffer(c, g_server.store, g_server.zset);
         if (prc == -1) {
+            /* ★ 注意这里【不再】补发 send_error：解析层在返回 -1 之前
+             *   已经发过 "-ERR protocol error"（见 parser.c）。再发一条
+             *   会让客户端收到两条错误，是协议失步的开始。
+             *   这里只负责记录日志并断开。 */
             fprintf(stderr, "[fd=%d] 协议错误，断开连接\n", fd);
             freeClient(el, c);
         }
@@ -359,9 +544,24 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *clientData, int mask) {
 static int writeToClientRaw(aeEventLoop *el, Client *c) {
     if (!c || !el) return -1;
 
-    while (sdslen(c->outbuf) > 0) {
-        size_t remaining = sdslen(c->outbuf);
-        ssize_t n = write(c->fd, c->outbuf, remaining);
+    /* ★★★ 这里用 outbuf_pos 做"已发送游标"，而不是每写完一块就把剩下的
+     *     全部 memmove 到头部。这是本次混合负载测试挖出来的真实性能缺陷：
+     *
+     *     旧写法：write(n) 成功后执行 sdsrange(c->outbuf, n, -1)
+     *             → 把 len-n 字节整体 memmove 到缓冲区开头。
+     *     问题：对端读得慢时 outbuf 会堆到几十 MB，而每次只写出几 KB
+     *           （socket 缓冲就那么大），于是每写一次都要搬动剩下的
+     *           几十 MB —— 总工作量是 O(n²/块大小)。
+     *     实测（本机，/tmp/memmove_bench）：64MB 缓冲、每次写 4KB 时，
+     *     单次 memmove 要 6.4ms，2000 次写累计 12.7 秒；
+     *     而同样的数据量如果只搬一次，总耗时 < 50ms。
+     *     这就是"只发不收的客户端能把别人 P99 打到 790ms"的真正原因。
+     *
+     *     修法（Redis 的 qb_pos 手法）：只推进游标，写完整块时才回收一次空间。
+     *     这样每次 write 之后不再搬内存，代价摊到"缓冲区真正空了"的那一刻。 */
+    while (c->outbuf_pos < sdslen(c->outbuf)) {
+        size_t remaining = sdslen(c->outbuf) - c->outbuf_pos;
+        ssize_t n = write(c->fd, c->outbuf + c->outbuf_pos, remaining);
 
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -383,11 +583,18 @@ static int writeToClientRaw(aeEventLoop *el, Client *c) {
             return -1;
         }
 
-        /* ① 部分或全部写出 → 消费掉已发出的部分 */
-        sdsrange(c->outbuf, n, -1);
+        /* ① 部分或全部写出 → ★ 只推进游标，不搬内存 */
+        c->outbuf_pos += (size_t)n;
     }
 
-    /* ③ outbuf 空了 → ★ 必须取消可写通知，否则 epoll_wait 会忙转 */
+    /* ③ outbuf 全部发完 → 一次性地把空间回收掉（只在这里 memmove/realloc，
+     *    也就是"攒够了再清"，而不是每次 write 都清） */
+    if (c->outbuf_pos > 0) {
+        sdsrange(c->outbuf, (long)c->outbuf_pos, -1);
+        c->outbuf_pos = 0;
+    }
+
+    /* ④ 空了 → ★ 必须取消可写通知，否则 epoll_wait 会忙转 */
     aeDeleteFileEvent(el, c->fd, AE_WRITABLE);
     return 1;
 }
@@ -428,9 +635,42 @@ void beforeSleep(aeEventLoop *el) {
     while (c) {
         Client *next = c->next;      /* ★ 先存，因为 c 可能被释放 */
 
-        if (sdslen(c->outbuf) > 0) {
+        /* ★ 输出缓冲超限的客户端在这里统一踢掉。
+         *   为什么放在 beforeSleep 而不是在 send_response 里直接断：
+         *   send_response 可能深藏在「解析 → 执行命令 → 编码回复」的
+         *   调用栈里，那一刻断开会把调用栈上所有还在用的 Client*
+         *   变成悬垂指针。beforeSleep 是「本轮所有回调都已返回」的安全点，
+         *   也正好是 flush 的唯一收口 —— 两者天然同一个位置。 */
+        if (c->output_over_limit) {
+            fprintf(stderr, "[fd=%d] 输出缓冲超限，断开连接（对端长时间不读回复）\n",
+                    c->fd);
+            freeClient(el, c);
+            c = next;
+            continue;
+        }
+
+        /* ★★ 只对"本轮有新数据待发"的客户端执行 write，否则会空转。
+         *
+         *   为什么这条判断是必须的（本次混合负载测试挖出的真实问题）：
+         *   outbuf 里堆着几十 MB、对端又不读时，write() 每次都返回 EAGAIN。
+         *   如果 beforeSleep 每轮都去试一次，而事件循环又因为
+         *   EPOLLOUT 一直被唤醒 → 形成"醒来→写→EAGAIN→注册 EPOLLOUT→
+         *   立刻又醒"的紧循环。实测服务端 CPU 打到 86%，
+         *   而正常业务的 PING 在这期间被拖到 844ms。
+         *   ★ 这正是 Redis 里 client->reply_bytes / 写入策略要解决的问题：
+         *     必须用"有新数据"这个事件来驱动发送，而不是"每次都试一下"。
+         *
+         *   outbuf_pos < sdslen(outbuf) 表示"还有没发完的数据"，
+         *   但光有这个条件还不够 —— 数据没发完时，发送时机应该是
+         *   【内核可写通知（EPOLLOUT）】，而不是每一轮 beforeSleep。
+         *   所以这里只在"本轮产生了新数据"时才尝试：
+         *   由 send_response 置位 c->reply_pending。 */
+        if (c->reply_pending) {
+            c->reply_pending = 0;
             if (writeToClientRaw(el, c) == -1) {
                 freeClient(el, c);    /* 写错误 → 关闭（c 已摘出链表） */
+                c = next;
+                continue;
             }
         }
         c = next;

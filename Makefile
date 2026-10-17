@@ -120,6 +120,17 @@ prodtest: loadgen
 prodtestquick: loadgen
 	python3 bench/prod_test.py --quick
 
+# 混合负载测试（真实生产环境模拟）：
+#   多样化命令 + 连接潮汐 + 只连不发 + 恶意流量 + 只发不收 + 不同大小请求
+#   同时压上去，验证「混在一起还活不活」。
+#   make mixtest       默认 15s 预热 + 45s 主压
+#   make mixtestquick  缩短规模冒烟（约 20 秒）
+mixtest:
+	python3 bench/mixload.py
+
+mixtestquick:
+	python3 bench/mixload.py --quick
+
 # ------------------------------------------------------------
 # 自动化集成测试：先编译，再运行 test.sh
 test: all
@@ -167,7 +178,7 @@ distclean: clean
 	rm -f final_bench.csv bench/*.csv
 
 # 伪目标声明（避免目录下恰好有同名文件导致冲突）
-.PHONY: all test unit check asan valgrind benskip benchrehash syscall clean distclean test_lookup_order loadgen abtest prodtest prodtestquick
+.PHONY: all test unit check asan valgrind benskip benchrehash syscall clean distclean test_lookup_order loadgen abtest prodtest prodtestquick mixtest mixtestquick
 
 # 引入自动生成的依赖；文件不存在时静默忽略（首次编译）
 -include $(DEPS)
